@@ -17,3 +17,9 @@ bot.log
 
 # OS specific
 .DS_Store
+/target
+Cargo.lock
+.env
+wallet.json
+config/*.json
+.DS_Store

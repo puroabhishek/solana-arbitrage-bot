@@ -10,7 +10,7 @@ use std::io::Read;
 use serde::{Serialize, Deserialize};
 use crate::{
     config::CONFIG,
-    types::PriceData,  // Remove unused Route and ArbitrageOpportunity
+    types::{PriceData, Route},  // Add Route back
     strategies::{Strategy, two_hop::TwoHopStrategy},
     execution::{ExecutionEngine, transaction_builder::TransactionBuilder, mev_builder::MEVBuilder},
 };
@@ -42,7 +42,6 @@ pub struct ArbitrageBot {
 }
 
 impl ArbitrageBot {
-    // In the ArbitrageBot::new() function
     pub fn new() -> Result<Self> {
         let wallet_path = std::env::var("WALLET_PATH")?;
         let mut key_file = File::open(wallet_path)?;
@@ -52,10 +51,9 @@ impl ArbitrageBot {
         let wallet = Keypair::from_bytes(&bs58::decode(&key_data.trim()).into_vec()?)?;
         let connection = RpcClient::new(&CONFIG.rpc_url);
         
-        // Use a new keypair for fee payer since Keypair doesn't implement Clone
         let transaction_builder = TransactionBuilder::new(
             Pubkey::new_unique(),
-            Keypair::new() // Use a new keypair instead of cloning
+            Keypair::new()
         );
         
         let mev_builder = Some(MEVBuilder::new("https://api.eden.network"));
@@ -78,21 +76,34 @@ impl ArbitrageBot {
         println!("Starting market monitoring on {} mode", self.mode);
         
         let prices = self.fetch_prices().await?;
+        let mut best_route = None;
+        let mut best_profit = self.min_profit;
+        let mut selected_strategy = None;
         
         for strategy in &self.strategies {
             let opportunities = strategy.find_opportunities(&prices).await?;
             for route in opportunities {
-                if strategy.estimate_profit(&route)? > self.min_profit 
-                   && route.steps[0].amount_in as f64 <= self.min_investment {
-                    if !dry_run {
-                        self.execution_engine.execute_route(&route, dry_run).await?;
-                    } else {
-                        println!("Dry run: Found profitable route with {}% profit", 
-                               strategy.estimate_profit(&route)?);
-                    }
+                let profit = strategy.estimate_profit(&route)?;
+                if profit > best_profit && route.steps[0].amount_in as f64 <= self.min_investment {
+                    best_profit = profit;
+                    best_route = Some(route);
+                    selected_strategy = Some(strategy);
                 }
             }
         }
+
+        if let (Some(route), Some(strategy)) = (best_route, selected_strategy) {
+            println!("Selected strategy: {}", strategy.name());
+            println!("Expected profit: {}%", best_profit);
+            
+            if !dry_run {
+                self.execution_engine.execute_route(&route, dry_run).await?;
+            } else {
+                println!("Dry run: Would execute trade with {}% profit using {}", 
+                    best_profit, strategy.name());
+            }
+        }
+
         Ok(())
     }
 
@@ -112,7 +123,6 @@ impl ArbitrageBot {
     }
 
     pub async fn fetch_prices(&self) -> Result<Vec<PriceData>> {
-        // Implementation
         Ok(vec![])
     }
 

@@ -24,16 +24,10 @@ impl Strategy for TwoHopStrategy {
     }
 
     async fn find_opportunities(&self, _prices: &[PriceData]) -> Result<Vec<Route>> {
-        // Implement opportunity finding logic
-        Ok(Vec::new())
+        Ok(vec![])
     }
 
     fn estimate_profit(&self, route: &Route) -> Result<f64> {
-        let profit = route.expected_profit;
-        if profit >= self.min_profit_percentage {
-            Ok(profit)
-        } else {
-            Ok(0.0)
-        }
+        Ok(route.expected_profit)
     }
 }

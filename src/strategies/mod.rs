@@ -6,6 +6,7 @@ use crate::types::{PriceData, Route, DEX, SwapStep};
 #[async_trait]
 pub trait Strategy: Send + Sync {
     fn name(&self) -> &'static str;
+    #[allow(async_fn_in_trait)]
     async fn find_opportunities(&self, prices: &[PriceData]) -> Result<Vec<Route>>;
     fn estimate_profit(&self, route: &Route) -> Result<f64>;
 }
