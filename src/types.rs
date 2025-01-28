@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Deserialize};
 use solana_sdk::pubkey::Pubkey;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,6 +29,7 @@ pub struct SwapStep {
     pub token_in: Pubkey,
     pub token_out: Pubkey,
     pub amount_in: u64,
+    pub amount_out: u64,
     pub minimum_amount_out: u64,
 }
 
@@ -37,4 +38,7 @@ pub enum DEX {
     Raydium,
     Orca,
     Meteora,
-} 
+}
+// Add common types here
+pub type Price = f64;
+pub type Amount = f64;

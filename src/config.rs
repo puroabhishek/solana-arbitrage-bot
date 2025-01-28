@@ -19,4 +19,4 @@ lazy_static! {
                 .unwrap_or(1.5),
         }
     };
-} 
+}

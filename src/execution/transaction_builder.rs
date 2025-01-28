@@ -14,6 +14,9 @@ pub struct TransactionBuilder {
 }
 
 impl TransactionBuilder {
+    /// Creates a new TransactionBuilder
+    /// fee_payer: The keypair that will pay for transaction fees
+    /// This should be loaded from the wallet configuration or environment
     pub fn new(program_id: Pubkey, fee_payer: Keypair) -> Self {
         Self {
             program_id,
@@ -41,11 +44,10 @@ impl TransactionBuilder {
     }
 
     fn build_swap_instruction(&self, _step: &crate::types::SwapStep) -> Result<Instruction> {
-        // Implement swap instruction building
         Ok(Instruction::new_with_bytes(
             self.program_id,
             &[],
             vec![]
         ))
     }
-} 
+}

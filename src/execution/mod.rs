@@ -1,9 +1,9 @@
+use anyhow::Result;
+use crate::types::Route;
+
 pub mod transaction_builder;
 pub mod mev_builder;
 
-use crate::types::Route;
-use anyhow::Result;
-use solana_sdk::transaction::Transaction as SolanaTransaction;
 use transaction_builder::TransactionBuilder;
 use mev_builder::MEVBuilder;
 
@@ -20,21 +20,17 @@ impl ExecutionEngine {
         }
     }
 
-    pub async fn execute_route(&self, route: Route) -> Result<String> {
-        // Build transaction
-        let transaction = self.transaction_builder.build_transaction(&route)?;
-
-        // If MEV builder is configured, use it
-        if let Some(mev_builder) = &self.mev_builder {
-            return mev_builder.submit_bundle(transaction).await;
+    pub async fn execute_route(&self, route: &Route, dry_run: bool) -> Result<String> {
+        if dry_run {
+            Ok("Dry run: Transaction would be executed".to_string())
+        } else {
+            let tx = self.transaction_builder.build_transaction(route)?;
+            
+            if let Some(mev_builder) = &self.mev_builder {
+                mev_builder.submit_bundle(tx.message.serialize()).await?;
+            }
+            
+            Ok("Transaction executed".to_string())
         }
-
-        // Otherwise submit normally
-        self.submit_transaction(transaction).await
     }
-
-    async fn submit_transaction(&self, _transaction: SolanaTransaction) -> Result<String> {
-        // Implement transaction submission logic
-        Ok("transaction_signature".to_string())
-    }
-} 
+}

@@ -1,0 +1,8 @@
+{
+    "rpc_url": "https://api.devnet.solana.com",
+    "wallet_path": "./wallet.json",
+    "minimum_profit_threshold": 1.5,
+    "max_transaction_retry": 3,
+    "slippage_tolerance": 0.5,
+    "mev_endpoint": "https://api.eden.network/v1/bundle"
+}

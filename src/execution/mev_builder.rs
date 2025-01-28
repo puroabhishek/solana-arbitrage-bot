@@ -1,19 +1,30 @@
 use anyhow::Result;
-use solana_sdk::transaction::Transaction;
+use reqwest::Client;
 
 pub struct MEVBuilder {
     endpoint: String,
+    client: Client,
 }
 
 impl MEVBuilder {
-    pub fn new() -> Self {
+    pub fn new(endpoint: &str) -> Self {
         Self {
-            endpoint: "https://mev.jito.wtf".to_string(),
+            endpoint: endpoint.to_string(),
+            client: Client::new(),
         }
     }
 
-    pub async fn submit_bundle(&self, _transaction: Transaction) -> Result<String> {
-        // Implement MEV bundle submission
-        Ok("bundle_submitted".to_string())
+    pub async fn submit_bundle(&self, transaction: Vec<u8>) -> Result<String> {
+        let response = self.client
+            .post(&self.endpoint)
+            .json(&transaction)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            Ok("Bundle submitted successfully".to_string())
+        } else {
+            Ok(format!("Bundle submission failed: {}", response.status()))
+        }
     }
-} 
+}

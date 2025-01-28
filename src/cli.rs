@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand};
 use dialoguer::{Input, Select, Confirm};
 use console::Term;
 use prettytable::{Table, row};
-use chrono::{DateTime, Utc};
 use anyhow::Result;
 use crate::bot::ArbitrageBot;
-use crate::types::ArbitrageOpportunity;
+use std::fs;
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -19,12 +19,20 @@ enum Commands {
     /// Start the arbitrage bot
     Start {
         /// Minimum profit percentage
-        #[arg(short, long)]
+        #[arg(short = 'p', long)]
         min_profit: Option<f64>,
         
         /// Maximum trade amount in SOL
-        #[arg(short, long)]
+        #[arg(short = 'a', long)]
         max_amount: Option<f64>,
+
+        /// Dry run without executing trades
+        #[arg(short, long)]
+        dry_run: bool,
+
+        /// Mode of operation (dev or mainnet)
+        #[arg(short, long)]
+        mode: String,
     },
     /// View transaction history
     History,
@@ -52,8 +60,8 @@ impl BotInterface {
         let interface = Self::new()?;
 
         match cli.command {
-            Commands::Start { min_profit, max_amount } => {
-                interface.start_bot(min_profit, max_amount).await?;
+            Commands::Start { min_profit, max_amount, dry_run, mode } => {
+                interface.start_bot(min_profit, max_amount, dry_run, mode).await?;
             }
             Commands::History => {
                 interface.show_history()?;
@@ -69,7 +77,7 @@ impl BotInterface {
         Ok(())
     }
 
-    async fn start_bot(&self, min_profit: Option<f64>, max_amount: Option<f64>) -> Result<()> {
+    async fn start_bot(&self, min_profit: Option<f64>, max_amount: Option<f64>, dry_run: bool, mode: String) -> Result<()> {
         let min_profit = if let Some(profit) = min_profit {
             profit
         } else {
@@ -91,6 +99,7 @@ impl BotInterface {
         println!("Starting bot with:");
         println!("Minimum profit: {}%", min_profit);
         println!("Maximum trade amount: {} SOL", max_amount);
+        println!("Mode: {}", mode);
 
         if !Confirm::new()
             .with_prompt("Continue with these settings?")
@@ -98,9 +107,21 @@ impl BotInterface {
             return Ok(());
         }
 
-        // Start the bot
-        self.bot.monitor_markets().await?;
+        // Load DEX program IDs from a JSON file
+        let dexes = self.load_dex_program_ids()?;
+        println!("Loaded DEX program IDs: {:?}", dexes);
+
+        // Start the bot with dry run option
+        self.bot.monitor_markets(dry_run).await?;
         Ok(())
+    }
+
+    fn load_dex_program_ids(&self) -> Result<Value> {
+        let dex_file = "config/dexes.json";
+        let data = fs::read_to_string(dex_file)
+            .map_err(|_| anyhow::anyhow!("dexes.json not found in config directory. Please create it first."))?;
+        let dexes: Value = serde_json::from_str(&data)?;
+        Ok(dexes)
     }
 
     fn show_history(&self) -> Result<()> {
@@ -188,7 +209,7 @@ impl BotInterface {
 
     fn show_status(&self) -> Result<()> {
         let status = self.bot.get_status();
-        println!("Bot Status: {}", serde_json::to_string_pretty(&status)?);
+        self.term.write_line(&format!("Bot Status: {}", status))?;
         Ok(())
     }
-} 
+}
