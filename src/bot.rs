@@ -10,7 +10,7 @@ use std::io::Read;
 use serde::{Serialize, Deserialize};
 use crate::{
     config::CONFIG,
-    types::{PriceData, Route},  // Add Route back
+    types::PriceData,
     strategies::{Strategy, two_hop::TwoHopStrategy},
     execution::{ExecutionEngine, transaction_builder::TransactionBuilder, mev_builder::MEVBuilder},
 };
@@ -47,8 +47,17 @@ impl ArbitrageBot {
         let mut key_file = File::open(wallet_path)?;
         let mut key_data = String::new();
         key_file.read_to_string(&mut key_data)?;
-        
-        let wallet = Keypair::from_bytes(&bs58::decode(&key_data.trim()).into_vec()?)?;
+        let key_data = key_data.trim();
+
+        // Supports both the standard Solana CLI JSON keypair array (e.g. from
+        // `solana-keygen new`) and a raw base58 secret key (e.g. exported from
+        // Phantom/Solflare).
+        let key_bytes = if key_data.starts_with('[') {
+            serde_json::from_str::<Vec<u8>>(key_data)?
+        } else {
+            bs58::decode(key_data).into_vec()?
+        };
+        let wallet = Keypair::from_bytes(&key_bytes)?;
         let connection = RpcClient::new(&CONFIG.rpc_url);
         
         let transaction_builder = TransactionBuilder::new(
@@ -84,7 +93,9 @@ impl ArbitrageBot {
             let opportunities = strategy.find_opportunities(&prices).await?;
             for route in opportunities {
                 let profit = strategy.estimate_profit(&route)?;
-                if profit > best_profit && route.steps[0].amount_in as f64 <= self.min_investment {
+                let within_investment = route.steps.first()
+                    .map_or(false, |step| step.amount_in as f64 <= self.min_investment);
+                if profit > best_profit && within_investment {
                     best_profit = profit;
                     best_route = Some(route);
                     selected_strategy = Some(strategy);
