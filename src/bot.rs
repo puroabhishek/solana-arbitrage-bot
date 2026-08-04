@@ -1,19 +1,22 @@
-use anyhow::Result;
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    signature::{Keypair, Signer},
-    pubkey::Pubkey,
-};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::signature::{Keypair, Signer};
 use std::fs::File;
 use std::io::Read;
-use serde::{Serialize, Deserialize};
-use crate::{
-    config::CONFIG,
-    types::PriceData,
-    strategies::{Strategy, two_hop::TwoHopStrategy},
-    execution::{ExecutionEngine, transaction_builder::TransactionBuilder, mev_builder::MEVBuilder},
+use std::sync::Arc;
+
+use crate::config::{lamports_to_sol, ExecutionMode, Network, CONFIG};
+use crate::execution::{
+    ledger::TradeLedger, transaction_builder::TransactionBuilder, ExecutionEngine,
+    ExecutionOutcome, SafetyLimits,
 };
+use crate::prices::{default_pairs, JupiterPriceSource, PriceSource, RoundTrip};
+use crate::strategies::{Strategy, TwoHopStrategy};
+use crate::types::{PriceData, Route, TradeRecord};
+
+pub const TRADE_LOG_PATH: &str = "data/trades.json";
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BotStatus {
@@ -29,93 +32,285 @@ pub struct BotStatus {
     pub wallet_balance: f64,
 }
 
+/// Load a wallet keypair from disk.
+///
+/// Accepts both formats users actually have: the Solana CLI's JSON byte array
+/// (`solana-keygen`) and a raw base58 secret key (Phantom/Solflare export).
+pub fn load_keypair(path: &str) -> Result<Keypair> {
+    let mut file = File::open(path)
+        .with_context(|| format!("opening wallet file '{}'", path))?;
+    let mut data = String::new();
+    file.read_to_string(&mut data)
+        .with_context(|| format!("reading wallet file '{}'", path))?;
+    let data = data.trim();
+
+    let bytes = if data.starts_with('[') {
+        serde_json::from_str::<Vec<u8>>(data)
+            .with_context(|| format!("parsing '{}' as a JSON keypair array", path))?
+    } else {
+        bs58::decode(data)
+            .into_vec()
+            .with_context(|| format!("decoding '{}' as a base58 secret key", path))?
+    };
+
+    Keypair::from_bytes(&bytes)
+        .with_context(|| format!("'{}' did not contain a valid 64-byte keypair", path))
+}
+
 pub struct ArbitrageBot {
     connection: RpcClient,
-    wallet: Keypair,
+    wallet_pubkey: solana_sdk::pubkey::Pubkey,
     start_time: DateTime<Utc>,
     strategies: Vec<Box<dyn Strategy>>,
     execution_engine: ExecutionEngine,
-    mode: String,
-    min_profit: f64,
-    min_investment: f64,
+    price_source: Arc<dyn PriceSource>,
+    ledger: TradeLedger,
+    mode: ExecutionMode,
+    network: Network,
+    trade_size_lamports: u64,
     status: BotStatus,
 }
 
 impl ArbitrageBot {
-    pub fn new() -> Result<Self> {
-        let wallet_path = std::env::var("WALLET_PATH")?;
-        let mut key_file = File::open(wallet_path)?;
-        let mut key_data = String::new();
-        key_file.read_to_string(&mut key_data)?;
-        let key_data = key_data.trim();
+    pub fn new(mode: ExecutionMode, network: Network, trade_size_lamports: u64) -> Result<Self> {
+        let wallet_path = CONFIG
+            .wallet_path
+            .clone()
+            .context("WALLET_PATH is not set; point it at your keypair file (see README)")?;
+        let wallet = load_keypair(&wallet_path)?;
+        let wallet_pubkey = wallet.pubkey();
 
-        // Supports both the standard Solana CLI JSON keypair array (e.g. from
-        // `solana-keygen new`) and a raw base58 secret key (e.g. exported from
-        // Phantom/Solflare).
-        let key_bytes = if key_data.starts_with('[') {
-            serde_json::from_str::<Vec<u8>>(key_data)?
-        } else {
-            bs58::decode(key_data).into_vec()?
-        };
-        let wallet = Keypair::from_bytes(&key_bytes)?;
-        let connection = RpcClient::new(&CONFIG.rpc_url);
-        
-        let transaction_builder = TransactionBuilder::new(
-            Pubkey::new_unique(),
-            Keypair::new()
+        let connection = RpcClient::new(CONFIG.rpc_url_for(network));
+
+        let price_source: Arc<dyn PriceSource> = Arc::new(JupiterPriceSource::new(
+            CONFIG.jupiter_base_url.clone(),
+            CONFIG.jupiter_api_key.clone(),
+            CONFIG.slippage_bps,
+            CONFIG.priority_fee_microlamports,
+        )?);
+
+        let execution_engine = ExecutionEngine::new(
+            TransactionBuilder::new(wallet, CONFIG.priority_fee_microlamports),
+            SafetyLimits {
+                max_spend_lamports: CONFIG.max_spend_lamports,
+                max_cumulative_loss_lamports: CONFIG.max_cumulative_loss_lamports,
+            },
         );
-        
-        let mev_builder = Some(MEVBuilder::new("https://api.eden.network"));
-        let execution_engine = ExecutionEngine::new(transaction_builder, mev_builder);
 
         Ok(Self {
             connection,
-            wallet,
+            wallet_pubkey,
             start_time: Utc::now(),
-            strategies: vec![Box::new(TwoHopStrategy::new(1.5))],
+            strategies: vec![Box::new(TwoHopStrategy::new(
+                CONFIG.min_profit_percentage,
+                CONFIG.priority_fee_microlamports,
+            ))],
             execution_engine,
-            mode: "devnet".to_string(),
-            min_profit: 1.5,
-            min_investment: 0.1,
+            price_source,
+            ledger: TradeLedger::load(TRADE_LOG_PATH)?,
+            mode,
+            network,
+            trade_size_lamports,
             status: BotStatus::default(),
         })
     }
 
-    pub async fn monitor_markets(&self, dry_run: bool) -> Result<()> {
-        println!("Starting market monitoring on {} mode", self.mode);
-        
-        let prices = self.fetch_prices().await?;
-        let mut best_route = None;
-        let mut best_profit = self.min_profit;
-        let mut selected_strategy = None;
-        
+    pub fn mode(&self) -> ExecutionMode {
+        self.mode
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    pub fn wallet_pubkey(&self) -> solana_sdk::pubkey::Pubkey {
+        self.wallet_pubkey
+    }
+
+    /// Fetch live round-trip quotes for every configured pair.
+    ///
+    /// Prices are always real, in every mode — quoting is read-only and risks
+    /// nothing, and detection logic tested against invented prices proves
+    /// nothing.
+    pub async fn fetch_round_trips(&self) -> Result<Vec<RoundTrip>> {
+        let mut out = Vec::new();
+
+        for (base, quote_token) in default_pairs() {
+            let label = format!("{}/{}", base.symbol, quote_token.symbol);
+
+            let forward = match self
+                .price_source
+                .quote(base.mint, quote_token.mint, self.trade_size_lamports)
+                .await
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    log::warn!("quote {} leg 1 failed: {}", label, e);
+                    continue;
+                }
+            };
+
+            // Second leg must start from exactly what the first leg returns,
+            // or the round trip is not a real one.
+            let back = match self
+                .price_source
+                .quote(quote_token.mint, base.mint, forward.out_amount)
+                .await
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    log::warn!("quote {} leg 2 failed: {}", label, e);
+                    continue;
+                }
+            };
+
+            out.push(RoundTrip {
+                label,
+                forward,
+                back,
+            });
+        }
+
+        Ok(out)
+    }
+
+    /// Round trips rendered as price observations, for display and logging.
+    pub fn as_price_data(round_trips: &[RoundTrip]) -> Vec<PriceData> {
+        round_trips
+            .iter()
+            .map(|rt| PriceData {
+                dex: "jupiter".to_string(),
+                token_pair: rt.label.clone(),
+                price: if rt.forward.in_amount == 0 {
+                    0.0
+                } else {
+                    rt.forward.out_amount as f64 / rt.forward.in_amount as f64
+                },
+                timestamp: Utc::now().timestamp(),
+            })
+            .collect()
+    }
+
+    /// One scan: quote, detect, and act as far as the mode allows.
+    pub async fn scan_once(&mut self) -> Result<()> {
+        let round_trips = self.fetch_round_trips().await?;
+        if round_trips.is_empty() {
+            log::info!("no quotes available this cycle");
+            return Ok(());
+        }
+
+        let mut best: Option<Route> = None;
         for strategy in &self.strategies {
-            let opportunities = strategy.find_opportunities(&prices).await?;
-            for route in opportunities {
-                let profit = strategy.estimate_profit(&route)?;
-                let within_investment = route.steps.first()
-                    .map_or(false, |step| step.amount_in as f64 <= self.min_investment);
-                if profit > best_profit && within_investment {
-                    best_profit = profit;
-                    best_route = Some(route);
-                    selected_strategy = Some(strategy);
+            for route in strategy.find_opportunities(&round_trips).await? {
+                if best.as_ref().map_or(true, |b| route.net_profit > b.net_profit) {
+                    best = Some(route);
                 }
             }
         }
 
-        if let (Some(route), Some(strategy)) = (best_route, selected_strategy) {
-            println!("Selected strategy: {}", strategy.name());
-            println!("Expected profit: {}%", best_profit);
-            
-            if !dry_run {
-                self.execution_engine.execute_route(&route, dry_run).await?;
-            } else {
-                println!("Dry run: Would execute trade with {}% profit using {}", 
-                    best_profit, strategy.name());
+        let route = match best {
+            Some(r) => r,
+            None => {
+                log::info!(
+                    "scanned {} pair(s), no net-profitable opportunity",
+                    round_trips.len()
+                );
+                return Ok(());
+            }
+        };
+
+        println!(
+            "Opportunity: {} | in {:.6} SOL -> out {:.6} SOL | net {:+.6} SOL ({:+.3}%)",
+            route.label,
+            lamports_to_sol(route.amount_in),
+            lamports_to_sol(route.amount_out),
+            route.net_profit as f64 / crate::config::LAMPORTS_PER_SOL as f64,
+            route.expected_profit
+        );
+
+        let outcome = self
+            .execution_engine
+            .execute_route(
+                &route,
+                self.mode,
+                &self.connection,
+                self.price_source.as_ref(),
+                &self.ledger,
+            )
+            .await?;
+
+        self.record(&route, &outcome)?;
+        Ok(())
+    }
+
+    fn record(&mut self, route: &Route, outcome: &ExecutionOutcome) -> Result<()> {
+        let (outcome_label, signature) = match outcome {
+            ExecutionOutcome::Detected => ("detected".to_string(), None),
+            ExecutionOutcome::Simulated => {
+                println!("  simulated OK (not submitted)");
+                ("simulated".to_string(), None)
+            }
+            ExecutionOutcome::Submitted { signature } => {
+                println!("  submitted: {}", signature);
+                ("submitted".to_string(), Some(signature.clone()))
+            }
+            ExecutionOutcome::Refused(r) => {
+                println!("  refused: {}", r);
+                (format!("refused: {}", r), None)
+            }
+        };
+
+        // Only a confirmed submission has a realised result; everything else
+        // must stay None so it cannot skew the loss cap.
+        let realised = match outcome {
+            ExecutionOutcome::Submitted { .. } => Some(route.net_profit),
+            _ => None,
+        };
+
+        self.status.total_trades += 1;
+        self.ledger.append(TradeRecord {
+            timestamp: Utc::now().to_rfc3339(),
+            mode: self.mode.to_string(),
+            label: route.label.clone(),
+            amount_in: route.amount_in,
+            expected_out: route.amount_out,
+            expected_profit_pct: route.expected_profit,
+            realised_profit: realised,
+            signature,
+            outcome: outcome_label,
+        })?;
+        Ok(())
+    }
+
+    /// Continuous monitoring loop, until Ctrl-C.
+    pub async fn monitor_markets(&mut self, poll_interval_secs: u64) -> Result<()> {
+        self.status.running = true;
+        println!(
+            "Monitoring {} on {} (mode: {}), polling every {}s. Ctrl-C to stop.",
+            self.price_source.name(),
+            self.network,
+            self.mode,
+            poll_interval_secs
+        );
+
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs.max(1)));
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.scan_once().await {
+                        // A single bad cycle must not kill a long-running bot.
+                        log::error!("scan failed: {}", e);
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nShutting down.");
+                    self.status.running = false;
+                    return Ok(());
+                }
             }
         }
-
-        Ok(())
     }
 
     pub fn get_status(&self) -> serde_json::Value {
@@ -126,19 +321,20 @@ impl ArbitrageBot {
         serde_json::json!({
             "status": if self.status.running { "running" } else { "stopped" },
             "uptime_seconds": uptime,
-            "current_profit": self.status.current_profit,
+            "mode": self.mode.to_string(),
+            "network": self.network.to_string(),
+            "wallet": self.wallet_pubkey.to_string(),
             "total_trades": self.status.total_trades,
-            "wallet_balance": self.status.wallet_balance,
-            "mode": self.mode
+            "cumulative_loss_sol": lamports_to_sol(self.ledger.cumulative_loss_lamports()),
         })
     }
 
-    pub async fn fetch_prices(&self) -> Result<Vec<PriceData>> {
-        Ok(vec![])
+    pub fn ledger(&self) -> &TradeLedger {
+        &self.ledger
     }
 
     pub async fn check_balance(&self) -> Result<f64> {
-        let balance = self.connection.get_balance(&self.wallet.pubkey())?;
-        Ok(balance as f64 / 1e9)
+        let balance = self.connection.get_balance(&self.wallet_pubkey)?;
+        Ok(lamports_to_sol(balance))
     }
 }

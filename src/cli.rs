@@ -1,11 +1,12 @@
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dialoguer::{Input, Select, Confirm};
 use console::Term;
-use prettytable::{Table, row};
-use anyhow::Result;
+use dialoguer::Confirm;
+use prettytable::{row, Table};
+
 use crate::bot::ArbitrageBot;
-use std::fs;
-use serde_json::Value;
+use crate::config::{lamports_to_sol, sol_to_lamports, ExecutionMode, Network, CONFIG};
+use crate::execution::ledger::TradeLedger;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -18,198 +19,202 @@ pub struct Cli {
 enum Commands {
     /// Start the arbitrage bot
     Start {
-        /// Minimum profit percentage
+        /// Minimum net profit percentage required to act
         #[arg(short = 'p', long)]
         min_profit: Option<f64>,
-        
-        /// Maximum trade amount in SOL
+
+        /// Trade size in SOL
         #[arg(short = 'a', long)]
-        max_amount: Option<f64>,
+        amount: Option<f64>,
 
-        /// Dry run without executing trades
-        #[arg(short, long)]
-        dry_run: bool,
+        /// How far to go: detect | rehearse | simulate | live
+        #[arg(short = 'm', long, default_value = "detect")]
+        mode: String,
 
-        /// Mode of operation (dev or mainnet)
-        #[arg(short, long)]
+        /// Cluster override: devnet | mainnet. Defaults to the mode's cluster.
+        #[arg(short = 'n', long)]
+        network: Option<String>,
+
+        /// Seconds between scans
+        #[arg(long)]
+        interval: Option<u64>,
+
+        /// Skip the confirmation prompt (required when not on a terminal)
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Run a single scan and exit instead of looping
+        #[arg(long)]
+        once: bool,
+    },
+    /// View recorded trade history
+    History,
+    /// View current status
+    Status {
+        /// Mode to report status for
+        #[arg(short = 'm', long, default_value = "detect")]
         mode: String,
     },
-    /// View transaction history
-    History,
-    /// Configure bot settings
-    Configure,
-    /// View current status
-    Status,
 }
 
-pub struct BotInterface {
-    bot: ArbitrageBot,
-    term: Term,
-}
+pub struct BotInterface;
 
 impl BotInterface {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            bot: ArbitrageBot::new()?,
-            term: Term::stdout(),
-        })
-    }
-
     pub async fn run() -> Result<()> {
         let cli = Cli::parse();
-        let interface = Self::new()?;
 
         match cli.command {
-            Commands::Start { min_profit, max_amount, dry_run, mode } => {
-                interface.start_bot(min_profit, max_amount, dry_run, mode).await?;
+            Commands::Start {
+                min_profit,
+                amount,
+                mode,
+                network,
+                interval,
+                yes,
+                once,
+            } => {
+                Self::start(min_profit, amount, &mode, network.as_deref(), interval, yes, once)
+                    .await
             }
-            Commands::History => {
-                interface.show_history()?;
-            }
-            Commands::Configure => {
-                interface.configure()?;
-            }
-            Commands::Status => {
-                interface.show_status()?;
-            }
+            Commands::History => Self::show_history(),
+            Commands::Status { mode } => Self::show_status(&mode).await,
         }
-
-        Ok(())
     }
 
-    async fn start_bot(&self, min_profit: Option<f64>, max_amount: Option<f64>, dry_run: bool, mode: String) -> Result<()> {
-        let min_profit = if let Some(profit) = min_profit {
-            profit
-        } else {
-            Input::new()
-                .with_prompt("Enter minimum profit percentage")
-                .default(1.5)
-                .interact()?
+    async fn start(
+        min_profit: Option<f64>,
+        amount: Option<f64>,
+        mode: &str,
+        network: Option<&str>,
+        interval: Option<u64>,
+        yes: bool,
+        once: bool,
+    ) -> Result<()> {
+        let mode: ExecutionMode = mode.parse()?;
+
+        // The mode implies its cluster, so the two cannot silently disagree —
+        // but an explicit override still wins.
+        let network: Network = match network {
+            Some(n) => n.parse()?,
+            None => mode.implied_network(),
         };
 
-        let max_amount = if let Some(amount) = max_amount {
-            amount
-        } else {
-            Input::new()
-                .with_prompt("Enter maximum trade amount in SOL")
-                .default(0.1)
-                .interact()?
-        };
+        let trade_size_sol = amount.unwrap_or(0.01);
+        let trade_size_lamports = sol_to_lamports(trade_size_sol);
+        let min_profit = min_profit.unwrap_or(CONFIG.min_profit_percentage);
+        let interval = interval.unwrap_or(CONFIG.poll_interval_secs);
 
-        println!("Starting bot with:");
-        println!("Minimum profit: {}%", min_profit);
-        println!("Maximum trade amount: {} SOL", max_amount);
-        println!("Mode: {}", mode);
+        println!("Mode:        {}", mode);
+        println!("Network:     {}", network);
+        println!("Trade size:  {} SOL", trade_size_sol);
+        println!("Min profit:  {}%", min_profit);
 
-        if !Confirm::new()
-            .with_prompt("Continue with these settings?")
-            .interact()? {
+        if mode.risks_real_funds() {
+            Self::print_live_warning(trade_size_lamports);
+        }
+
+        if !Self::confirm(yes, mode)? {
+            println!("Aborted.");
             return Ok(());
         }
 
-        // Load DEX program IDs from a JSON file
-        let dexes = self.load_dex_program_ids()?;
-        println!("Loaded DEX program IDs: {:?}", dexes);
+        let mut bot = ArbitrageBot::new(mode, network, trade_size_lamports)?;
+        println!("Wallet:      {}", bot.wallet_pubkey());
 
-        // Start the bot with dry run option
-        self.bot.monitor_markets(dry_run).await?;
-        Ok(())
-    }
-
-    fn load_dex_program_ids(&self) -> Result<Value> {
-        let dex_file = "config/dexes.json";
-        let data = fs::read_to_string(dex_file)
-            .map_err(|_| anyhow::anyhow!("dexes.json not found in config directory. Please create it first."))?;
-        let dexes: Value = serde_json::from_str(&data)?;
-        Ok(dexes)
-    }
-
-    fn show_history(&self) -> Result<()> {
-        let mut table = Table::new();
-        table.add_row(row!["Time", "Type", "Amount", "Profit", "Status"]);
-
-        // Add sample data (replace with actual transaction history)
-        table.add_row(row![
-            "2024-03-14 10:30:00",
-            "Two-Hop",
-            "0.1 SOL",
-            "+1.8%",
-            "Success"
-        ]);
-
-        table.printstd();
-        Ok(())
-    }
-
-    fn configure(&self) -> Result<()> {
-        let options = vec!["RPC Endpoint", "Wallet", "Strategy Settings", "Network"];
-        let selection = Select::new()
-            .with_prompt("Select setting to configure")
-            .items(&options)
-            .interact()?;
-
-        match selection {
-            0 => self.configure_rpc()?,
-            1 => self.configure_wallet()?,
-            2 => self.configure_strategy()?,
-            3 => self.configure_network()?,
-            _ => unreachable!(),
+        match bot.check_balance().await {
+            Ok(balance) => println!("Balance:     {:.6} SOL", balance),
+            // A balance read failing is not fatal in non-spending modes.
+            Err(e) => println!("Balance:     unavailable ({})", e),
         }
 
+        if once {
+            bot.scan_once().await
+        } else {
+            bot.monitor_markets(interval).await
+        }
+    }
+
+    fn print_live_warning(trade_size_lamports: u64) {
+        println!();
+        println!("  ***  LIVE MODE — REAL FUNDS WILL BE SPENT  ***");
+        match CONFIG.max_spend_lamports {
+            Some(cap) => println!(
+                "  Per-trade cap:   {:.6} SOL (this trade: {:.6} SOL)",
+                lamports_to_sol(cap),
+                lamports_to_sol(trade_size_lamports)
+            ),
+            None => println!("  Per-trade cap:   NOT SET — trades will be refused"),
+        }
+        match CONFIG.max_cumulative_loss_lamports {
+            Some(cap) => println!("  Total loss cap:  {:.6} SOL", lamports_to_sol(cap)),
+            None => println!("  Total loss cap:  NOT SET — trades will be refused"),
+        }
+        println!();
+    }
+
+    /// Ask for confirmation, tolerating a non-interactive environment.
+    ///
+    /// The previous implementation called `Confirm` unconditionally, which
+    /// hard-fails with "not a terminal" when piped — making unattended
+    /// operation impossible for what is meant to be a long-running bot.
+    fn confirm(yes: bool, mode: ExecutionMode) -> Result<bool> {
+        if yes {
+            return Ok(true);
+        }
+        if !console::user_attended() {
+            // Refuse only where real money is at stake; safe modes proceed.
+            if mode.risks_real_funds() {
+                anyhow::bail!(
+                    "live mode needs confirmation but no terminal is attached; pass --yes to proceed"
+                );
+            }
+            return Ok(true);
+        }
+        Confirm::new()
+            .with_prompt("Continue with these settings?")
+            .default(false)
+            .interact()
+            .context("reading confirmation")
+    }
+
+    fn show_history() -> Result<()> {
+        let ledger = TradeLedger::load(crate::bot::TRADE_LOG_PATH)?;
+        let records = ledger.records();
+
+        if records.is_empty() {
+            println!("No trades recorded yet.");
+            return Ok(());
+        }
+
+        let mut table = Table::new();
+        table.add_row(row!["Time", "Mode", "Pair", "In (SOL)", "Expected", "Outcome"]);
+        for r in records {
+            table.add_row(row![
+                r.timestamp,
+                r.mode,
+                r.label,
+                format!("{:.6}", lamports_to_sol(r.amount_in)),
+                format!("{:+.3}%", r.expected_profit_pct),
+                r.outcome,
+            ]);
+        }
+        table.printstd();
+
+        println!(
+            "\nCumulative realised loss: {:.6} SOL",
+            lamports_to_sol(ledger.cumulative_loss_lamports())
+        );
         Ok(())
     }
 
-    fn configure_rpc(&self) -> Result<()> {
-        let rpc_url: String = Input::new()
-            .with_prompt("Enter RPC URL")
-            .default(String::from("https://api.devnet.solana.com"))
-            .interact()?;
-
-        println!("RPC URL updated to: {}", rpc_url);
-        // TODO: Save to config
-        Ok(())
-    }
-
-    fn configure_wallet(&self) -> Result<()> {
-        let wallet_path: String = Input::new()
-            .with_prompt("Enter wallet path")
-            .interact()?;
-
-        println!("Wallet path updated to: {}", wallet_path);
-        // TODO: Save to config
-        Ok(())
-    }
-
-    fn configure_strategy(&self) -> Result<()> {
-        let strategies = vec!["Two-Hop", "Triangle", "Multi-DEX"];
-        let selection = Select::new()
-            .with_prompt("Select strategy to configure")
-            .items(&strategies)
-            .interact()?;
-
-        let min_profit: f64 = Input::new()
-            .with_prompt("Enter minimum profit percentage")
-            .default(1.5)
-            .interact()?;
-
-        println!("Strategy {} configured with min profit: {}%", strategies[selection], min_profit);
-        Ok(())
-    }
-
-    fn configure_network(&self) -> Result<()> {
-        let networks = vec!["Devnet", "Mainnet"];
-        let selection = Select::new()
-            .with_prompt("Select network")
-            .items(&networks)
-            .interact()?;
-
-        println!("Network switched to: {}", networks[selection]);
-        Ok(())
-    }
-
-    fn show_status(&self) -> Result<()> {
-        let status = self.bot.get_status();
-        self.term.write_line(&format!("Bot Status: {}", status))?;
+    async fn show_status(mode: &str) -> Result<()> {
+        let mode: ExecutionMode = mode.parse()?;
+        let bot = ArbitrageBot::new(mode, mode.implied_network(), sol_to_lamports(0.01))?;
+        let term = Term::stdout();
+        term.write_line(&format!(
+            "{}",
+            serde_json::to_string_pretty(&bot.get_status())?
+        ))?;
         Ok(())
     }
 }

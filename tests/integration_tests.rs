@@ -1,34 +1,164 @@
-use solana_arbitrage_bot::bot::ArbitrageBot;
+//! End-to-end tests that need no network access and no funded wallet.
+//!
+//! Live prices are used in every real run of this bot, but tests deliberately
+//! use `MockPriceSource` so the suite stays offline, fast and deterministic.
+
 use anyhow::Result;
+use solana_arbitrage_bot::{
+    config::{sol_to_lamports, ExecutionMode, Network},
+    execution::{
+        ledger::TradeLedger, transaction_builder::TransactionBuilder, ExecutionEngine, Refusal,
+        SafetyLimits,
+    },
+    prices::{MockPriceSource, PriceSource, RoundTrip, SOL, USDC},
+    strategies::{Strategy, TwoHopStrategy},
+};
 use solana_sdk::signature::Keypair;
-use std::io::Write;
 
-/// Writes a throwaway keypair to a temp file and points WALLET_PATH at it, so
-/// tests don't depend on a real funded wallet or network access.
-fn setup_test_wallet() -> Result<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(format!("solana-arbitrage-bot-test-wallet-{}.json", std::process::id()));
-    let keypair = Keypair::new();
-    let mut file = std::fs::File::create(&path)?;
-    file.write_all(serde_json::to_string(&keypair.to_bytes().to_vec())?.as_bytes())?;
+fn engine(spend: Option<u64>, loss: Option<u64>) -> ExecutionEngine {
+    ExecutionEngine::new(
+        TransactionBuilder::new(Keypair::new(), 1_000),
+        SafetyLimits {
+            max_spend_lamports: spend,
+            max_cumulative_loss_lamports: loss,
+        },
+    )
+}
 
-    std::env::set_var("WALLET_PATH", &path);
-    std::env::set_var("SOLANA_RPC_URL", "https://api.devnet.solana.com");
-    Ok(path)
+/// Build a round trip through the mock source, exactly as the bot would.
+async fn round_trip(forward_rate: f64, back_rate: f64, amount: u64) -> Result<RoundTrip> {
+    let mut src = MockPriceSource::new(50);
+    src.set_rate(SOL.mint, USDC.mint, forward_rate);
+    src.set_rate(USDC.mint, SOL.mint, back_rate);
+
+    let forward = src.quote(SOL.mint, USDC.mint, amount).await?;
+    let back = src.quote(USDC.mint, SOL.mint, forward.out_amount).await?;
+
+    Ok(RoundTrip {
+        label: format!("{}/{}", SOL.symbol, USDC.symbol),
+        forward,
+        back,
+    })
 }
 
 #[tokio::test]
-async fn test_bot_lifecycle() -> Result<()> {
-    let wallet_path = setup_test_wallet()?;
+async fn detects_profitable_round_trip_end_to_end() -> Result<()> {
+    // 2% round-trip gain: out and back at rates whose product exceeds 1.
+    let rt = round_trip(100.0, 0.0102, sol_to_lamports(1.0)).await?;
+    let strategy = TwoHopStrategy::new(1.0, 1_000);
 
-    let bot = ArbitrageBot::new()?;
-    assert!(bot.get_status().get("status").is_some());
+    let routes = strategy.find_opportunities(&[rt]).await?;
+    assert_eq!(routes.len(), 1, "expected one profitable route");
+    assert!(routes[0].net_profit > 0);
+    assert_eq!(routes[0].steps.len(), 2, "a round trip has two legs");
+    Ok(())
+}
 
-    // fetch_prices/find_opportunities are currently stubs (see README/known
-    // limitations) that return no data - this just verifies the call path
-    // works end to end without panicking or requiring network access.
-    let prices = bot.fetch_prices().await?;
-    assert!(prices.is_empty());
+#[tokio::test]
+async fn ignores_break_even_round_trip() -> Result<()> {
+    // Product of rates is exactly 1: gross break-even, so a net loss once
+    // fees are counted.
+    let rt = round_trip(100.0, 0.01, sol_to_lamports(1.0)).await?;
+    let strategy = TwoHopStrategy::new(0.0, 1_000);
 
-    std::fs::remove_file(&wallet_path).ok();
+    let routes = strategy.find_opportunities(&[rt]).await?;
+    assert!(
+        routes.is_empty(),
+        "break-even before fees must not be treated as an opportunity"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn detect_and_simulate_never_submit() {
+    let e = engine(Some(sol_to_lamports(1.0)), Some(sol_to_lamports(1.0)));
+
+    for mode in [ExecutionMode::Detect, ExecutionMode::Simulate] {
+        match e.check_limits(mode, sol_to_lamports(0.01), 0) {
+            Some(Refusal::ModeDoesNotSubmit(_)) => {}
+            other => panic!("{:?} should never submit, got {:?}", mode, other),
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_is_refused_without_caps() {
+    let e = engine(None, None);
+    assert_eq!(
+        e.check_limits(ExecutionMode::Live, sol_to_lamports(0.01), 0),
+        Some(Refusal::NoSpendCapConfigured),
+        "live trading must be impossible without a spend cap"
+    );
+
+    let e = engine(Some(sol_to_lamports(1.0)), None);
+    assert_eq!(
+        e.check_limits(ExecutionMode::Live, sol_to_lamports(0.01), 0),
+        Some(Refusal::NoLossCapConfigured),
+        "live trading must be impossible without a loss cap"
+    );
+}
+
+#[tokio::test]
+async fn live_respects_spend_and_loss_caps() {
+    let cap = sol_to_lamports(0.05);
+    let loss_cap = sol_to_lamports(0.1);
+    let e = engine(Some(cap), Some(loss_cap));
+
+    // Over the per-trade cap.
+    assert!(matches!(
+        e.check_limits(ExecutionMode::Live, cap + 1, 0),
+        Some(Refusal::ExceedsSpendCap { .. })
+    ));
+
+    // Within caps.
+    assert_eq!(e.check_limits(ExecutionMode::Live, cap, 0), None);
+
+    // Loss cap reached halts trading entirely.
+    assert!(matches!(
+        e.check_limits(ExecutionMode::Live, 1, loss_cap),
+        Some(Refusal::LossCapReached { .. })
+    ));
+}
+
+#[tokio::test]
+async fn rehearse_needs_no_caps_since_it_spends_no_real_funds() {
+    let e = engine(None, None);
+    assert_eq!(e.check_limits(ExecutionMode::Rehearse, u64::MAX, 0), None);
+}
+
+#[test]
+fn modes_imply_sensible_networks() {
+    // Rehearsal is devnet by definition; real trading needs mainnet liquidity.
+    assert_eq!(ExecutionMode::Rehearse.implied_network(), Network::Devnet);
+    assert_eq!(ExecutionMode::Simulate.implied_network(), Network::Mainnet);
+    assert_eq!(ExecutionMode::Live.implied_network(), Network::Mainnet);
+}
+
+#[test]
+fn ledger_loss_survives_reload() -> Result<()> {
+    use solana_arbitrage_bot::types::TradeRecord;
+
+    let dir = std::env::temp_dir().join(format!("arb-int-{}", std::process::id()));
+    let path = dir.join("trades.json");
+    std::fs::remove_dir_all(&dir).ok();
+
+    let mut ledger = TradeLedger::load(&path)?;
+    ledger.append(TradeRecord {
+        timestamp: "2026-01-01T00:00:00Z".into(),
+        mode: "live".into(),
+        label: "SOL/USDC".into(),
+        amount_in: sol_to_lamports(0.01),
+        expected_out: sol_to_lamports(0.011),
+        expected_profit_pct: 1.0,
+        realised_profit: Some(-(sol_to_lamports(0.002) as i64)),
+        signature: None,
+        outcome: "submitted".into(),
+    })?;
+
+    // A cap that forgets on restart is not a cap.
+    let reloaded = TradeLedger::load(&path)?;
+    assert_eq!(reloaded.cumulative_loss_lamports(), sol_to_lamports(0.002));
+
+    std::fs::remove_dir_all(&dir).ok();
     Ok(())
 }

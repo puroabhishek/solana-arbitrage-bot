@@ -1,73 +1,89 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use solana_sdk::pubkey::Pubkey;  // Add this import
-use crate::types::{PriceData, Route, DEX, SwapStep};
 
-#[async_trait]
-pub trait Strategy: Send + Sync {
-    fn name(&self) -> &'static str;
-    #[allow(async_fn_in_trait)]
-    async fn find_opportunities(&self, prices: &[PriceData]) -> Result<Vec<Route>>;
-    fn estimate_profit(&self, route: &Route) -> Result<f64>;
-}
+use crate::prices::RoundTrip;
+use crate::types::Route;
 
 pub mod two_hop;
 pub use two_hop::TwoHopStrategy;
 
-// Remove the duplicate Strategy trait definition that was here
-
-pub fn create_route_from_price(price: &PriceData, is_testing: bool) -> Route {
-    // Define a list of DEXs to consider (excluding Lifinity, Jupiter, and Phoenix)
-    let dexes = vec![
-        DEX::Raydium,
-        DEX::Orca,
-        DEX::Meteora,
-    ];
-
-    // Initialize variables to track the best opportunity
-    let mut best_step: Option<SwapStep> = None;
-    let mut best_profit = f64::MIN; // Start with the lowest possible profit
-
-    // Iterate over each DEX to find the best opportunity
-    for dex in &dexes {
-        // Retrieve the price based on whether we are in testing or production mode
-        let (amount_out, _simulated_price) = if is_testing {
-            // Simulated price retrieval for testing
-            (1000.0, 1000.0) // Example values
-        } else {
-            // Actual price retrieval logic (to be implemented)
-            get_price_from_dex(dex, price) // Pass a reference to dex
-        };
-
-        let amount_in: u64 = 1000; // Example amount
-
-        // Calculate profit
-        let profit = (amount_out - amount_in as f64) / amount_in as f64 * 100.0;
-
-        // Check if this DEX offers a better profit
-        if profit > best_profit {
-            best_profit = profit;
-            best_step = Some(SwapStep {
-                dex: dex.clone(), // Clone dex to avoid moving
-                token_in: price.token_pair.split('/').next().unwrap().parse::<Pubkey>().unwrap(),
-                token_out: price.token_pair.split('/').nth(1).unwrap().parse::<Pubkey>().unwrap(),
-                amount_in,
-                amount_out: amount_out as u64, // Convert to u64
-                minimum_amount_out: 0, // Placeholder
-            });
-        }
-    }
-
-    // Create the route with the best step found
-    let steps = best_step.map_or(vec![], |step| vec![step]);
-
-    Route {
-        steps,
-        expected_profit: best_profit, // Set the expected profit based on the best opportunity
-    }
+/// A way of turning candidate round trips into executable routes.
+///
+/// Takes `RoundTrip` rather than scalar prices: a route can only be built from
+/// real quotes, since the quote carries the routing data the swap needs.
+#[async_trait]
+pub trait Strategy: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn find_opportunities(&self, round_trips: &[RoundTrip]) -> Result<Vec<Route>>;
+    fn estimate_profit(&self, route: &Route) -> Result<f64>;
 }
 
-// Placeholder function for getting price from DEX
-fn get_price_from_dex(_dex: &DEX, _price: &PriceData) -> (f64, f64) {
-    (1000.0, 1000.0)
+/// Solana's per-signature base fee.
+pub const BASE_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+
+/// Total lamports a trade costs to land, independent of its size.
+///
+/// Priority fee is quoted in micro-lamports per compute unit, so it must be
+/// scaled by the compute budget and divided down by 1e6.
+pub fn transaction_cost_lamports(
+    signatures: u64,
+    priority_fee_microlamports: u64,
+    compute_units: u64,
+) -> u64 {
+    let base = BASE_SIGNATURE_FEE_LAMPORTS.saturating_mul(signatures);
+    let priority = priority_fee_microlamports
+        .saturating_mul(compute_units)
+        .saturating_div(1_000_000);
+    base.saturating_add(priority)
+}
+
+/// Net profit of a round trip, in lamports, after transaction costs.
+///
+/// Returns a signed value: negative means the round trip loses money. Taking
+/// gross profit here instead is the classic way a toy bot convinces itself it
+/// is winning while its wallet drains.
+pub fn net_profit_lamports(amount_in: u64, amount_out: u64, tx_cost: u64) -> i64 {
+    amount_out as i64 - amount_in as i64 - tx_cost as i64
+}
+
+/// Net profit as a percentage of the amount committed.
+pub fn net_profit_percentage(amount_in: u64, amount_out: u64, tx_cost: u64) -> f64 {
+    if amount_in == 0 {
+        return 0.0;
+    }
+    net_profit_lamports(amount_in, amount_out, tx_cost) as f64 / amount_in as f64 * 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_fee_is_scaled_by_compute_units() {
+        // 1000 micro-lamports/CU over 200k CU = 200_000_000 micro = 200 lamports
+        let cost = transaction_cost_lamports(1, 1_000, 200_000);
+        assert_eq!(cost, BASE_SIGNATURE_FEE_LAMPORTS + 200);
+    }
+
+    #[test]
+    fn gross_gain_can_still_be_a_net_loss() {
+        // Out exceeds in by 1000, but the trade costs 5200 to land.
+        let cost = transaction_cost_lamports(1, 1_000, 200_000);
+        let net = net_profit_lamports(1_000_000, 1_001_000, cost);
+        assert!(net < 0, "expected a net loss, got {}", net);
+    }
+
+    #[test]
+    fn genuinely_profitable_round_trip_is_positive() {
+        let cost = transaction_cost_lamports(1, 1_000, 200_000);
+        let net = net_profit_lamports(1_000_000, 1_020_000, cost);
+        assert!(net > 0);
+        let pct = net_profit_percentage(1_000_000, 1_020_000, cost);
+        assert!(pct > 1.4 && pct < 1.5, "unexpected pct {}", pct);
+    }
+
+    #[test]
+    fn zero_input_does_not_divide_by_zero() {
+        assert_eq!(net_profit_percentage(0, 100, 0), 0.0);
+    }
 }

@@ -1,41 +1,54 @@
 # Solana Arbitrage Bot
 
-A Rust CLI scaffold for monitoring and (eventually) executing arbitrage
-opportunities across Solana DEXes.
+A Rust CLI bot that scans live Solana DEX prices via the Jupiter aggregator for
+circular arbitrage opportunities, and can execute them under strict safety caps.
 
-> **Project status: work in progress — it does not trade yet.**
-> The CLI, configuration, wallet loading, RPC connection and balance checks
-> work. Price fetching, opportunity detection, swap-instruction building and
-> transaction submission are still stubs. See
-> [Current limitations](#current-limitations) before using this.
+> **Read this before running anything with real funds.** Mainnet arbitrage is a
+> latency race against well-capitalised bots on co-located infrastructure. This
+> bot is correct and careful, but correctness is the entry fee, not an edge —
+> most opportunities it detects will be gone before a transaction lands. Treat
+> any capital you point at it as capital you can afford to lose entirely.
 
-## What works today
+## Execution modes
 
-- CLI with `start`, `status`, `history` and `configure` subcommands
-- Loads a wallet keypair from disk (Solana CLI JSON or raw base58)
-- Connects to a Solana RPC endpoint and reads the wallet balance
-- Configurable minimum profit threshold and dry-run flag
-- Strategy trait with a `TwoHopStrategy` implementation wired in
+The bot works as a ladder. Each rung tests something the ones below it cannot,
+and you are meant to promote through them in order.
 
-## Current limitations
+| Mode | Prices | Transaction | Submitted | Risk |
+| --- | --- | --- | --- | --- |
+| `detect` (default) | Real, live | none | no | none |
+| `rehearse` | Real, live | real, non-swap, devnet | **yes, to devnet** | none (test SOL) |
+| `simulate` | Real, live | real mainnet swap | no | none |
+| `live` | Real, live | real mainnet swap | **yes** | **real funds** |
 
-These are scaffolding only, and are the work remaining before the bot can
-place a real trade:
+**Prices are always real, in every mode.** Quoting is a read-only HTTP call that
+spends nothing, and detection logic tested against invented prices proves
+nothing. What changes between modes is only whether a transaction is submitted.
 
-| Area | Status |
-| --- | --- |
-| Price fetching (`ArbitrageBot::fetch_prices`) | Returns an empty list |
-| Opportunity detection (`TwoHopStrategy::find_opportunities`) | Returns an empty list |
-| Swap instruction building (`TransactionBuilder::build_swap_instruction`) | Returns an empty instruction |
-| Recent blockhash | Uses `Hash::default()`, not fetched from RPC |
-| Transaction submission | Never calls `send_transaction` / `send_and_confirm_transaction` |
-| Transaction signer | Uses a throwaway keypair, not the loaded wallet |
-| MEV bundle submission | Posts to a hardcoded endpoint, no auth |
-| Trade history (`history`) | Prints a hardcoded sample row |
-| `configure` subcommand | Prints values but does not persist them |
+Two details worth understanding:
 
-`cargo run -- start --mode devnet` runs end to end (wallet load, config, DEX ID
-load, monitoring loop) but will not find or execute trades.
+- **`rehearse` cannot submit a real swap.** A swap transaction encodes mainnet
+  pool accounts that do not exist on devnet. Instead it submits a real but
+  trivial transaction (a zero-value self-transfer) carrying the same
+  compute-budget and priority-fee instructions, which exercises the entire
+  sign → submit → confirm → log path for free. It proves the *submission
+  machinery*; `simulate` proves the *swap itself*.
+- **`simulate` always runs before `live` submits.** Even in live mode, the
+  transaction is simulated against the cluster first, and submission is aborted
+  if simulation fails.
+
+## Safety
+
+`live` mode refuses to submit anything unless **both** caps are configured:
+
+- `MAX_TRADE_AMOUNT_SOL` — per-trade ceiling
+- `MAX_CUMULATIVE_LOSS_SOL` — total realised loss before the bot halts
+
+The loss cap is tracked in `data/trades.json` and reloaded at startup, so it
+survives restarts and crashes — a cap that resets on restart is not a cap.
+Profits do **not** top the budget back up; it limits how much this bot may lose
+while proving itself, not running P&L. Once tripped, the bot halts until you
+clear that file deliberately.
 
 ## Requirements
 
@@ -106,43 +119,55 @@ wallet's public address.
    ```bash
    cargo build
    ```
-5. Run against devnet:
+5. Watch for opportunities, risking nothing:
    ```bash
-   cargo run -- start --mode devnet --dry-run
+   cargo run -- start
    ```
 
 ## Configuration
 
 All runtime configuration comes from environment variables in `.env` (see
-`.env.example`):
+`.env.example` for the annotated list):
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `SOLANA_RPC_URL` | Solana RPC endpoint | `https://api.devnet.solana.com` |
 | `WALLET_PATH` | Path to the wallet keypair file | *(required)* |
-| `MIN_PROFIT_PERCENTAGE` | Minimum profit threshold | `1.5` |
+| `SOLANA_RPC_URL` | RPC override | cluster default |
+| `SOLANA_NETWORK` | `devnet` / `mainnet` | implied by mode |
+| `JUPITER_API_KEY` | Jupiter paid tier; unset uses the free tier | *(unset)* |
+| `MIN_PROFIT_PERCENTAGE` | Minimum **net** profit to act on | `1.5` |
+| `SLIPPAGE_BPS` | Slippage tolerance | `50` |
+| `PRIORITY_FEE_MICROLAMPORTS` | Priority fee per compute unit | `1000` |
+| `POLL_INTERVAL_SECS` | Seconds between scans | `10` |
+| `MAX_TRADE_AMOUNT_SOL` | Per-trade cap — **required for `live`** | *(unset)* |
+| `MAX_CUMULATIVE_LOSS_SOL` | Total loss cap — **required for `live`** | *(unset)* |
 
 Notes:
 
 - `WALLET_PATH` does **not** expand `~` — use an absolute path.
-- `config/config.json` is **not read by the bot**. Editing it has no effect;
-  only `.env` matters.
-- `config/dexes.json` holds DEX program IDs, currently only printed at startup.
-- `MAX_TRADE_AMOUNT_SOL`, `RAYDIUM_PROGRAM_ID` and `ORCA_PROGRAM_ID` appear in
-  `.env.example` but are not yet read by any code.
+- `config/config.json` is **not read by the bot**. Only `.env` matters.
+- Leaving `JUPITER_API_KEY` unset uses Jupiter's free tier
+  (`lite-api.jup.ag`), which needs no signup but is rate limited. Setting a key
+  switches to the paid host automatically.
 
 ## Usage
 
 ```bash
-cargo run -- start --mode devnet --dry-run   # monitor without executing
-cargo run -- start --mode devnet \
-  --min-profit 2.0 --max-amount 0.1          # non-interactive thresholds
-cargo run -- status                          # bot status as JSON
-cargo run -- history                         # trade history (sample data)
-cargo run -- configure                       # interactive config (not persisted)
+cargo run -- start                          # detect (default): watch only
+cargo run -- start --mode rehearse --yes    # real devnet submit, free test SOL
+cargo run -- start --mode simulate --yes    # real mainnet tx, not submitted
+cargo run -- start --mode live --yes        # real trade (needs both caps set)
+
+cargo run -- start --once                   # single scan instead of looping
+cargo run -- start -a 0.05 -p 2.0           # 0.05 SOL trades, 2% min net profit
+cargo run -- status                         # status as JSON
+cargo run -- history                        # recorded trades + realised loss
 ```
 
-Omitted `--min-profit` / `--max-amount` are prompted for interactively.
+Pass `--yes` to skip the confirmation prompt. The bot runs unattended: when no
+terminal is attached it proceeds automatically in the safe modes, and refuses to
+start in `live` without `--yes` rather than hanging on a prompt nothing can
+answer.
 
 ## Testing
 
@@ -151,8 +176,10 @@ cargo build
 cargo test
 ```
 
-The integration test generates a throwaway keypair in a temp directory and sets
-`WALLET_PATH` itself, so it needs no real wallet or network access.
+Tests need no network access, no funded wallet and no API key — they run against
+a deterministic mock price source and cover the profit math (including that a
+gross gain smaller than fees is *not* an opportunity), the lamports/SOL
+boundary, and every safety refusal.
 
 ## Security
 
@@ -162,6 +189,20 @@ The integration test generates a throwaway keypair in a temp directory and sets
   repository. They have been removed from the working tree, but **remain in
   git history** — treat them as compromised and rotate them.
 - Prefer a dedicated, minimally funded wallet over your primary one.
+- Never paste a paid RPC URL containing an embedded API key into a shared
+  channel — it belongs in `.env` only.
+
+## Known limitations
+
+- **MEV/Jito bundle submission** (`src/execution/mev_builder.rs`) is unchanged
+  scaffolding, not wired into the execution path.
+- **Only two-hop (`A -> B -> A`) routes** are implemented. Triangular routes
+  across three tokens are not.
+- **Realised profit is recorded as the expected value**, not measured from
+  post-trade balances, so the loss cap is an estimate rather than a settled
+  accounting of what actually happened on-chain.
+- Only `SOL/USDC` and `SOL/USDT` are scanned; the pair list is a compile-time
+  constant in `src/prices/mod.rs`.
 
 ## Backup
 
