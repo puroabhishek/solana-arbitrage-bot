@@ -108,21 +108,41 @@ wallet's public address.
 
 ## Setup
 
-1. Clone the repository.
-2. Copy the environment template and fill in real values:
-   ```bash
-   cp .env.example .env
-   ```
-3. Set `WALLET_PATH` in `.env` to the keypair file from
-   [Wallet setup](#wallet-setup). **Never commit this file.**
-4. Build:
-   ```bash
-   cargo build
-   ```
-5. Watch for opportunities, risking nothing:
-   ```bash
-   cargo run -- start
-   ```
+Fastest path — checks prerequisites, creates a dedicated wallet, writes a
+working `.env`, and builds. Safe to re-run; it never overwrites an existing
+wallet or `.env`:
+
+```bash
+./scripts/setup.sh
+```
+
+<details>
+<summary>Or do it manually</summary>
+
+```bash
+cp .env.example .env
+solana-keygen new --outfile ~/.config/solana/bot-wallet.json
+chmod 600 ~/.config/solana/bot-wallet.json
+# Set WALLET_PATH in .env to that ABSOLUTE path ("~" is not expanded)
+cargo build --release
+```
+</details>
+
+Then work up the ladder, one rung at a time:
+
+```bash
+cargo run --example offline_demo               # 1. logic, no network or funds
+cargo run --release -- start                   # 2. live prices, spends nothing
+cargo run --release -- start --mode rehearse --yes   # 3. real devnet submit
+cargo run --release -- start --mode simulate --yes   # 4. real tx, not sent
+cargo run --release -- start --mode live --yes       # 5. real money
+```
+
+Step 3 needs devnet SOL:
+`solana airdrop 1 $(solana-keygen pubkey ~/.config/solana/bot-wallet.json) --url devnet`
+
+Do not skip rungs — each catches a different class of failure, and only step 5
+can cost you anything.
 
 ## Configuration
 
@@ -191,6 +211,42 @@ boundary, and every safety refusal.
 - Prefer a dedicated, minimally funded wallet over your primary one.
 - Never paste a paid RPC URL containing an embedded API key into a shared
   channel — it belongs in `.env` only.
+
+## Discord alerts
+
+The bot can post to a Discord channel so you do not have to watch a terminal.
+It uses an **incoming webhook** — no bot token, no OAuth, no persistent gateway
+connection, just an HTTPS POST.
+
+Setup:
+
+1. In Discord: **channel → Edit Channel → Integrations → Webhooks → New
+   Webhook**, then **Copy Webhook URL**.
+2. Put it in `.env`:
+   ```
+   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/.../...
+   ```
+
+Treat that URL as a secret — anyone holding it can post to your channel. Leave
+it unset to disable alerts.
+
+You get pinged for:
+
+| Event | Severity |
+| --- | --- |
+| Bot started / stopped | info |
+| Opportunity detected | info |
+| Simulated OK | notable |
+| Trade submitted (with a Solscan link) | notable |
+| Trade refused (cap exceeded, etc.) | notable |
+| **Halted — loss cap reached** | alert |
+| **Simulation failed** | alert |
+| 5 consecutive scan failures | alert |
+
+Two deliberate behaviours: notification failures are logged and swallowed, so a
+Discord outage can never stop or crash trading; and repeated scan failures
+alert **once** at a threshold rather than every cycle, so an outage does not
+become a flood.
 
 ## Strategies
 

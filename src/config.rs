@@ -141,6 +141,8 @@ pub struct Config {
     pub jupiter_api_key: Option<String>,
     pub poll_interval_secs: u64,
     pub wallet_path: Option<String>,
+    /// Discord incoming-webhook URL. Unset disables notifications entirely.
+    pub discord_webhook_url: Option<String>,
 }
 
 impl Config {
@@ -198,6 +200,7 @@ lazy_static! {
             jupiter_api_key,
             poll_interval_secs: env_parse("POLL_INTERVAL_SECS", 10),
             wallet_path: env_opt("WALLET_PATH"),
+            discord_webhook_url: env_opt("DISCORD_WEBHOOK_URL"),
         }
     };
 }

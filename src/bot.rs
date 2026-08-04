@@ -10,8 +10,9 @@ use std::sync::Arc;
 use crate::config::{lamports_to_sol, ExecutionMode, Network, CONFIG};
 use crate::execution::{
     ledger::TradeLedger, transaction_builder::TransactionBuilder, ExecutionEngine,
-    ExecutionOutcome, SafetyLimits,
+    ExecutionOutcome, Refusal, SafetyLimits,
 };
+use crate::notify::{DiscordNotifier, Level, Notification, Notifier, Notifiers};
 use crate::prices::{default_pairs, JupiterPriceSource, PriceSource, RoundTrip};
 use crate::strategies::{self, Strategy};
 use crate::types::{PriceData, Route, TradeRecord};
@@ -65,6 +66,7 @@ pub struct ArbitrageBot {
     execution_engine: ExecutionEngine,
     price_source: Arc<dyn PriceSource>,
     ledger: TradeLedger,
+    notifiers: Notifiers,
     mode: ExecutionMode,
     network: Network,
     trade_size_lamports: u64,
@@ -112,6 +114,14 @@ impl ArbitrageBot {
             CONFIG.priority_fee_microlamports,
         )?;
 
+        // A bad webhook URL fails here, at startup, rather than silently
+        // never delivering an alert you were relying on.
+        let mut targets: Vec<Box<dyn Notifier>> = Vec::new();
+        if let Some(url) = &CONFIG.discord_webhook_url {
+            targets.push(Box::new(DiscordNotifier::new(url.clone())?));
+        }
+        let notifiers = Notifiers::new(targets);
+
         Ok(Self {
             connection,
             wallet_pubkey,
@@ -120,6 +130,7 @@ impl ArbitrageBot {
             execution_engine,
             price_source,
             ledger: TradeLedger::load(TRADE_LOG_PATH)?,
+            notifiers,
             mode,
             network,
             trade_size_lamports,
@@ -259,11 +270,11 @@ impl ArbitrageBot {
             )
             .await?;
 
-        self.record(&route, &outcome)?;
+        self.record(&route, &outcome).await?;
         Ok(())
     }
 
-    fn record(&mut self, route: &Route, outcome: &ExecutionOutcome) -> Result<()> {
+    async fn record(&mut self, route: &Route, outcome: &ExecutionOutcome) -> Result<()> {
         let (outcome_label, signature) = match outcome {
             ExecutionOutcome::Detected => ("detected".to_string(), None),
             ExecutionOutcome::Simulated => {
@@ -308,10 +319,69 @@ impl ArbitrageBot {
             costs: route.costs,
             caps,
             realised_profit: realised,
-            signature,
-            outcome: outcome_label,
+            signature: signature.clone(),
+            outcome: outcome_label.clone(),
         })?;
+
+        self.alert(route, outcome, &outcome_label, signature).await;
         Ok(())
+    }
+
+    /// Send an alert for a decision, if any notifier is configured.
+    async fn alert(
+        &self,
+        route: &Route,
+        outcome: &ExecutionOutcome,
+        outcome_label: &str,
+        signature: Option<String>,
+    ) {
+        if self.notifiers.is_empty() {
+            return;
+        }
+
+        // Severity follows what actually happened: a halt or failed
+        // submission needs attention, a refusal is worth seeing, a detection
+        // is routine.
+        let (level, title) = match outcome {
+            ExecutionOutcome::Detected => (Level::Info, "Opportunity detected"),
+            ExecutionOutcome::Simulated => (Level::Notable, "Simulated OK"),
+            ExecutionOutcome::Submitted { .. } => (Level::Notable, "Trade submitted"),
+            ExecutionOutcome::Refused(Refusal::LossCapReached { .. }) => {
+                (Level::Alert, "HALTED: loss cap reached")
+            }
+            ExecutionOutcome::Refused(Refusal::SimulationFailed(_)) => {
+                (Level::Alert, "Simulation failed")
+            }
+            ExecutionOutcome::Refused(_) => (Level::Notable, "Trade refused"),
+        };
+
+        let mut n = Notification::new(
+            level,
+            format!("{} — {}", title, route.label),
+            outcome_label.to_string(),
+        )
+        .field("Mode", self.mode.to_string())
+        .field("Strategy", route.strategy.to_string())
+        .field("In", format!("{:.6} SOL", lamports_to_sol(route.amount_in)))
+        .field(
+            "Net",
+            format!("{:+} lamports ({:+.3}%)", route.net_profit, route.expected_profit),
+        )
+        .field(
+            "Fees",
+            format!(
+                "{} ({}+{})",
+                route.costs.total_lamports(),
+                route.costs.base_fee_lamports,
+                route.costs.priority_fee_lamports
+            ),
+        );
+
+        if let Some(sig) = signature {
+            n = n.field("Explorer", format!("https://solscan.io/tx/{}", sig));
+        }
+
+        self.notifiers.notify(n).await;
     }
 
     /// Continuous monitoring loop, until Ctrl-C.
@@ -325,20 +395,57 @@ impl ArbitrageBot {
             poll_interval_secs
         );
 
+        if !self.notifiers.is_empty() {
+            println!("Alerts:      {}", self.notifiers.names().join(", "));
+            self.notifiers
+                .notify(
+                    Notification::new(
+                        Level::Info,
+                        "Bot started",
+                        format!("Watching for opportunities every {}s.", poll_interval_secs),
+                    )
+                    .field("Mode", self.mode.to_string())
+                    .field("Network", self.network.to_string())
+                    .field("Wallet", self.wallet_pubkey.to_string()),
+                )
+                .await;
+        }
+
         let mut ticker =
             tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs.max(1)));
+
+        // Repeated failures are worth one alert, but alerting on every cycle
+        // would turn an outage into a flood.
+        let mut consecutive_failures: u32 = 0;
+        const FAILURE_ALERT_THRESHOLD: u32 = 5;
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(e) = self.scan_once().await {
-                        // A single bad cycle must not kill a long-running bot.
-                        log::error!("scan failed: {}", e);
+                    match self.scan_once().await {
+                        Ok(()) => consecutive_failures = 0,
+                        Err(e) => {
+                            // A single bad cycle must not kill a long-running bot.
+                            log::error!("scan failed: {}", e);
+                            consecutive_failures += 1;
+                            if consecutive_failures == FAILURE_ALERT_THRESHOLD {
+                                self.notifiers.notify(Notification::new(
+                                    Level::Alert,
+                                    "Repeated scan failures",
+                                    format!("{} cycles in a row failed. Latest: {}", consecutive_failures, e),
+                                )).await;
+                            }
+                        }
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     println!("\nShutting down.");
                     self.status.running = false;
+                    self.notifiers.notify(Notification::new(
+                        Level::Info,
+                        "Bot stopped",
+                        "Shut down cleanly.",
+                    )).await;
                     return Ok(());
                 }
             }

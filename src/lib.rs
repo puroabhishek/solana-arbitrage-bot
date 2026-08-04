@@ -2,6 +2,7 @@ pub mod bot;
 pub mod cli;
 pub mod config;
 pub mod execution;
+pub mod notify;
 pub mod prices;
 pub mod strategies;
 pub mod types;

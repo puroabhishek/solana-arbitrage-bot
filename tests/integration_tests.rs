@@ -232,3 +232,52 @@ fn ledger_loss_survives_reload() -> Result<()> {
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
 }
+
+/// Verifies the Discord notifier produces a well-formed webhook request.
+///
+/// Discord itself is unreachable from CI, so this points the notifier at a
+/// local socket and inspects exactly what goes on the wire.
+#[tokio::test]
+async fn discord_notifier_sends_wellformed_webhook() -> Result<()> {
+    use solana_arbitrage_bot::notify::{DiscordNotifier, Level, Notification, Notifier};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    // https:// is enforced, so exercise the payload via the same code path
+    // with a plain-HTTP override only a test can construct.
+    let notifier = DiscordNotifier::new_unchecked(format!("http://{}/webhook", addr))?;
+    notifier
+        .send(
+            &Notification::new(Level::Alert, "HALTED: loss cap reached", "stopping")
+                .field("Mode", "live")
+                .field("Net", "-1234 lamports"),
+        )
+        .await?;
+
+    let request = server.await?;
+    assert!(request.starts_with("POST /webhook"), "got: {}", request);
+    assert!(request.contains("content-type: application/json"));
+
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+    let json: serde_json::Value = serde_json::from_str(body)?;
+    let embed = &json["embeds"][0];
+
+    assert_eq!(embed["title"], "HALTED: loss cap reached");
+    assert_eq!(embed["description"], "stopping");
+    assert_eq!(embed["color"], 0xED4245); // alert red
+    assert_eq!(embed["fields"][0]["name"], "Mode");
+    assert_eq!(embed["fields"][1]["value"], "-1234 lamports");
+    Ok(())
+}
