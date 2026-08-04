@@ -1,9 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::{net_profit_lamports, net_profit_percentage, transaction_cost_lamports, Strategy};
+use super::{net_profit_lamports, net_profit_percentage, Strategy, TradeCosts};
 use crate::prices::RoundTrip;
 use crate::types::{Route, SwapStep, DEX};
+
+pub const STRATEGY_NAME: &str = "two-hop";
 
 /// Compute units a two-leg swap is assumed to consume when estimating the
 /// priority-fee component of cost. Jupiter sets the real limit dynamically;
@@ -14,7 +16,6 @@ const ASSUMED_COMPUTE_UNITS: u64 = 400_000;
 const SIGNATURE_COUNT: u64 = 1;
 
 pub struct TwoHopStrategy {
-    name: &'static str,
     min_profit_percentage: f64,
     priority_fee_microlamports: u64,
 }
@@ -22,15 +23,14 @@ pub struct TwoHopStrategy {
 impl TwoHopStrategy {
     pub fn new(min_profit_percentage: f64, priority_fee_microlamports: u64) -> Self {
         Self {
-            name: "Two-Hop Strategy",
             min_profit_percentage,
             priority_fee_microlamports,
         }
     }
 
-    /// Cost in lamports for one attempt, independent of trade size.
-    fn tx_cost(&self) -> u64 {
-        transaction_cost_lamports(
+    /// Itemised cost for one attempt, independent of trade size.
+    fn costs(&self) -> TradeCosts {
+        TradeCosts::estimate(
             SIGNATURE_COUNT,
             self.priority_fee_microlamports,
             ASSUMED_COMPUTE_UNITS,
@@ -39,7 +39,8 @@ impl TwoHopStrategy {
 
     /// Turn a round trip into a Route, whether or not it is profitable.
     fn to_route(&self, rt: &RoundTrip) -> Route {
-        let cost = self.tx_cost();
+        let costs = self.costs();
+        let cost = costs.total_lamports();
         let amount_in = rt.amount_in();
         let amount_out = rt.amount_out();
 
@@ -66,9 +67,12 @@ impl TwoHopStrategy {
             steps,
             expected_profit: net_profit_percentage(amount_in, amount_out, cost),
             label: rt.label.clone(),
+            strategy: STRATEGY_NAME,
             amount_in,
             amount_out,
+            gross_profit: amount_out as i64 - amount_in as i64,
             net_profit: net_profit_lamports(amount_in, amount_out, cost),
+            costs,
             quotes: vec![rt.forward.clone(), rt.back.clone()],
         }
     }
@@ -77,7 +81,7 @@ impl TwoHopStrategy {
 #[async_trait]
 impl Strategy for TwoHopStrategy {
     fn name(&self) -> &'static str {
-        self.name
+        STRATEGY_NAME
     }
 
     async fn find_opportunities(&self, round_trips: &[RoundTrip]) -> Result<Vec<Route>> {

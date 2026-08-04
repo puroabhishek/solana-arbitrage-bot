@@ -192,15 +192,79 @@ boundary, and every safety refusal.
 - Never paste a paid RPC URL containing an embedded API key into a shared
   channel — it belongs in `.env` only.
 
+## Strategies
+
+Pick one with `--strategy`; list them with `cargo run -- strategies`.
+
+| Strategy | Description |
+| --- | --- |
+| `two-hop` (default) | `A -> B -> A` round trip through the aggregator |
+
+Only two-hop is implemented. Triangular and cross-venue strategies fit the same
+trait and are deliberately absent rather than present as non-working stubs.
+
+### Adding one
+
+Everything else — detection loop, execution gate, safety caps, logging, CLI —
+works against the `Strategy` trait, not any concrete strategy. Adding one is
+two steps:
+
+1. Implement `Strategy` (see `src/strategies/two_hop.rs`):
+   ```rust
+   #[async_trait]
+   impl Strategy for TriangularStrategy {
+       fn name(&self) -> &'static str { "triangular" }
+       async fn find_opportunities(&self, rts: &[RoundTrip]) -> Result<Vec<Route>> { ... }
+       fn estimate_profit(&self, route: &Route) -> Result<f64> { ... }
+   }
+   ```
+2. Register it in `strategies::build` and add it to `strategies::AVAILABLE`
+   (`src/strategies/mod.rs`).
+
+Set `Route::strategy` to your `name()` and every trade is automatically
+attributed to it in the log. Use `TradeCosts::estimate` so costs are itemised
+consistently — the profit check must be **net**, or the strategy will report
+wins it did not earn.
+
+## Understanding the numbers
+
+Amounts are in **lamports**, the smallest unit of SOL:
+**1 SOL = 1,000,000,000 lamports.**
+
+Every trade costs a fixed amount to land regardless of size:
+
+| Component | Typical | What it is |
+| --- | --- | --- |
+| Base fee | 5,000 lamports | Solana's per-signature charge |
+| Priority fee | 400 lamports | `PRIORITY_FEE_MICROLAMPORTS` × compute units ÷ 1e6 |
+| **Total** | **~5,400 lamports** | Subtracted before a trade is judged profitable |
+
+That is ~0.0000054 SOL — trivial in absolute terms, decisive on a thin margin.
+Trading 0.01 SOL for a 1% edge earns ~100,000 lamports gross, so fees are ~5%
+of the profit; on a thinner edge they turn a "win" into a loss. This is why the
+bot rejects a +5,000 lamport gross gain: landing it costs more than it makes.
+
+`cargo run -- history` shows gross, fees (itemised), net, and the caps in force
+for every trade, so any decision can be audited after the fact:
+
+```
+| Mode   | Strategy | Pair     | In (SOL) | Gross   | Fees            | Net     | Net %   | Cap    | Outcome
+| detect | two-hop  | SOL/USDC | 0.010000 | +210000 | 5400 (5000+400) | +204600 | +2.046% | 0.0500 | detected
+| live   | two-hop  | SOL/USDC | 0.060000 | +1300000| 5400 (5000+400) | +1294600| +2.158% | 0.0500 | refused: above the 0.05 SOL cap
+```
+
 ## Known limitations
 
 - **MEV/Jito bundle submission** (`src/execution/mev_builder.rs`) is unchanged
   scaffolding, not wired into the execution path.
 - **Only two-hop (`A -> B -> A`) routes** are implemented. Triangular routes
-  across three tokens are not.
+  across three tokens are not — see [Adding one](#adding-one).
 - **Realised profit is recorded as the expected value**, not measured from
   post-trade balances, so the loss cap is an estimate rather than a settled
   accounting of what actually happened on-chain.
+- **Costs are estimated, not actual.** The logged fee breakdown uses an assumed
+  400,000 compute units; the real transaction's compute usage and the network's
+  prevailing priority fee at submission time may differ.
 - Only `SOL/USDC` and `SOL/USDT` are scanned; the pair list is a compile-time
   constant in `src/prices/mod.rs`.
 

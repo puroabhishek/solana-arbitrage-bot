@@ -79,6 +79,17 @@ pub struct SafetyLimits {
     pub max_cumulative_loss_lamports: Option<u64>,
 }
 
+impl SafetyLimits {
+    /// Capture the limits in force, for the trade log.
+    pub fn snapshot(&self, cumulative_loss: u64) -> crate::types::CapSnapshot {
+        crate::types::CapSnapshot {
+            max_spend_lamports: self.max_spend_lamports,
+            max_cumulative_loss_lamports: self.max_cumulative_loss_lamports,
+            cumulative_loss_at_evaluation: cumulative_loss,
+        }
+    }
+}
+
 pub struct ExecutionEngine {
     transaction_builder: TransactionBuilder,
     limits: SafetyLimits,
@@ -94,6 +105,10 @@ impl ExecutionEngine {
 
     pub fn builder(&self) -> &TransactionBuilder {
         &self.transaction_builder
+    }
+
+    pub fn limits(&self) -> &SafetyLimits {
+        &self.limits
     }
 
     /// Check every rule that can block a submission, without doing any I/O.

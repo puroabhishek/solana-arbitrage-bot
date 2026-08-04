@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::prices::Quote;
+use crate::strategies::TradeCosts;
 
 /// A price observation, kept for display and logging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,12 +31,18 @@ pub struct Route {
     pub expected_profit: f64,
     /// Display label, e.g. "SOL/USDC".
     pub label: String,
+    /// Which strategy produced this route.
+    pub strategy: &'static str,
     /// Base units of the starting token committed.
     pub amount_in: u64,
     /// Base units of the starting token expected back.
     pub amount_out: u64,
+    /// Gross difference before costs. Negative is a loss.
+    pub gross_profit: i64,
     /// Net profit in base units after transaction costs. Negative is a loss.
     pub net_profit: i64,
+    /// Itemised cost of landing this trade.
+    pub costs: TradeCosts,
     /// The quotes backing each leg, needed to request swap transactions.
     pub quotes: Vec<Quote>,
 }
@@ -70,16 +77,44 @@ impl std::fmt::Display for DEX {
     }
 }
 
+/// The safety limits in force at the moment a trade was evaluated.
+///
+/// Snapshotted per trade rather than read from config at review time, because
+/// config changes: without this, a log entry cannot answer "what were the caps
+/// when this was allowed through?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapSnapshot {
+    /// Per-trade ceiling in lamports, if configured.
+    pub max_spend_lamports: Option<u64>,
+    /// Cumulative realised-loss ceiling in lamports, if configured.
+    pub max_cumulative_loss_lamports: Option<u64>,
+    /// Realised losses accumulated before this trade was evaluated.
+    pub cumulative_loss_at_evaluation: u64,
+}
+
 /// A recorded trade attempt, persisted so history and the loss cap survive
 /// restarts.
+///
+/// Deliberately verbose: every number that fed the decision is recorded, so a
+/// trade — taken or refused — can be fully audited later without rerunning it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRecord {
     pub timestamp: String,
     pub mode: String,
+    /// Which strategy produced the route.
+    pub strategy: String,
     pub label: String,
     pub amount_in: u64,
     pub expected_out: u64,
+    /// Difference before costs, in lamports.
+    pub gross_profit: i64,
+    /// Difference after costs, in lamports. This drives the decision.
+    pub net_profit: i64,
     pub expected_profit_pct: f64,
+    /// Itemised cost of landing the trade.
+    pub costs: TradeCosts,
+    /// Limits in force when this trade was evaluated.
+    pub caps: CapSnapshot,
     /// Realised profit in base units once known. Negative is a loss.
     pub realised_profit: Option<i64>,
     pub signature: Option<String>,

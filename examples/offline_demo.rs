@@ -46,8 +46,14 @@ async fn evaluate(name: &str, rt: RoundTrip, strategy: &TwoHopStrategy) -> Resul
 
     match strategy.find_opportunities(&[rt]).await?.first() {
         Some(route) => println!(
-            "  ACTED ON: net {:+} lamports ({:+.3}%)",
-            route.net_profit, route.expected_profit
+            "  ACTED ON [{}]: gross {:+} - fees {} (base {} + priority {}) = net {:+} ({:+.3}%)",
+            route.strategy,
+            route.gross_profit,
+            route.costs.total_lamports(),
+            route.costs.base_fee_lamports,
+            route.costs.priority_fee_lamports,
+            route.net_profit,
+            route.expected_profit
         ),
         None => println!("  rejected: not net-profitable above the threshold"),
     }

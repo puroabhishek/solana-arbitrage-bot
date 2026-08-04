@@ -71,13 +71,25 @@ mod tests {
     use super::*;
 
     fn record(realised: Option<i64>) -> TradeRecord {
+        use crate::strategies::TradeCosts;
+        use crate::types::CapSnapshot;
+
         TradeRecord {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             mode: "live".to_string(),
+            strategy: "two-hop".to_string(),
             label: "SOL/USDC".to_string(),
             amount_in: 1_000_000,
             expected_out: 1_010_000,
+            gross_profit: 10_000,
+            net_profit: 4_600,
             expected_profit_pct: 1.0,
+            costs: TradeCosts::estimate(1, 1_000, 400_000),
+            caps: CapSnapshot {
+                max_spend_lamports: Some(10_000_000),
+                max_cumulative_loss_lamports: Some(50_000_000),
+                cumulative_loss_at_evaluation: 0,
+            },
             realised_profit: realised,
             signature: None,
             outcome: "confirmed".to_string(),

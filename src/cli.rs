@@ -35,6 +35,10 @@ enum Commands {
         #[arg(short = 'n', long)]
         network: Option<String>,
 
+        /// Which strategy to run
+        #[arg(short = 's', long, default_value = "two-hop")]
+        strategy: String,
+
         /// Seconds between scans
         #[arg(long)]
         interval: Option<u64>,
@@ -55,6 +59,8 @@ enum Commands {
         #[arg(short = 'm', long, default_value = "detect")]
         mode: String,
     },
+    /// List available strategies
+    Strategies,
 }
 
 pub struct BotInterface;
@@ -69,23 +75,42 @@ impl BotInterface {
                 amount,
                 mode,
                 network,
+                strategy,
                 interval,
                 yes,
                 once,
             } => {
-                Self::start(min_profit, amount, &mode, network.as_deref(), interval, yes, once)
-                    .await
+                Self::start(
+                    min_profit,
+                    amount,
+                    &mode,
+                    network.as_deref(),
+                    &strategy,
+                    interval,
+                    yes,
+                    once,
+                )
+                .await
             }
             Commands::History => Self::show_history(),
             Commands::Status { mode } => Self::show_status(&mode).await,
+            Commands::Strategies => {
+                println!("Available strategies:");
+                for s in crate::strategies::AVAILABLE {
+                    println!("  {}", s);
+                }
+                Ok(())
+            }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         min_profit: Option<f64>,
         amount: Option<f64>,
         mode: &str,
         network: Option<&str>,
+        strategy: &str,
         interval: Option<u64>,
         yes: bool,
         once: bool,
@@ -106,6 +131,7 @@ impl BotInterface {
 
         println!("Mode:        {}", mode);
         println!("Network:     {}", network);
+        println!("Strategy:    {}", strategy);
         println!("Trade size:  {} SOL", trade_size_sol);
         println!("Min profit:  {}%", min_profit);
 
@@ -118,7 +144,7 @@ impl BotInterface {
             return Ok(());
         }
 
-        let mut bot = ArbitrageBot::new(mode, network, trade_size_lamports)?;
+        let mut bot = ArbitrageBot::new(mode, network, trade_size_lamports, strategy)?;
         println!("Wallet:      {}", bot.wallet_pubkey());
 
         match bot.check_balance().await {
@@ -187,29 +213,66 @@ impl BotInterface {
         }
 
         let mut table = Table::new();
-        table.add_row(row!["Time", "Mode", "Pair", "In (SOL)", "Expected", "Outcome"]);
+        table.add_row(row![
+            "Time",
+            "Mode",
+            "Strategy",
+            "Pair",
+            "In (SOL)",
+            "Gross",
+            "Fees",
+            "Net",
+            "Net %",
+            "Cap",
+            "Outcome"
+        ]);
         for r in records {
             table.add_row(row![
                 r.timestamp,
                 r.mode,
+                r.strategy,
                 r.label,
                 format!("{:.6}", lamports_to_sol(r.amount_in)),
+                format!("{:+}", r.gross_profit),
+                // Base + priority, itemised so a rejection is auditable.
+                format!(
+                    "{} ({}+{})",
+                    r.costs.total_lamports(),
+                    r.costs.base_fee_lamports,
+                    r.costs.priority_fee_lamports
+                ),
+                format!("{:+}", r.net_profit),
                 format!("{:+.3}%", r.expected_profit_pct),
+                match r.caps.max_spend_lamports {
+                    Some(c) => format!("{:.4}", lamports_to_sol(c)),
+                    None => "unset".to_string(),
+                },
                 r.outcome,
             ]);
         }
         table.printstd();
 
+        println!("\nAmounts in lamports (1 SOL = 1,000,000,000 lamports).");
+        println!("Fees column: total (base + priority).");
         println!(
-            "\nCumulative realised loss: {:.6} SOL",
-            lamports_to_sol(ledger.cumulative_loss_lamports())
+            "Cumulative realised loss: {:.6} SOL{}",
+            lamports_to_sol(ledger.cumulative_loss_lamports()),
+            match records.last().and_then(|r| r.caps.max_cumulative_loss_lamports) {
+                Some(cap) => format!(" (cap {:.6} SOL)", lamports_to_sol(cap)),
+                None => " (no cap configured)".to_string(),
+            }
         );
         Ok(())
     }
 
     async fn show_status(mode: &str) -> Result<()> {
         let mode: ExecutionMode = mode.parse()?;
-        let bot = ArbitrageBot::new(mode, mode.implied_network(), sol_to_lamports(0.01))?;
+        let bot = ArbitrageBot::new(
+            mode,
+            mode.implied_network(),
+            sol_to_lamports(0.01),
+            "two-hop",
+        )?;
         let term = Term::stdout();
         term.write_line(&format!(
             "{}",

@@ -13,7 +13,7 @@ use crate::execution::{
     ExecutionOutcome, SafetyLimits,
 };
 use crate::prices::{default_pairs, JupiterPriceSource, PriceSource, RoundTrip};
-use crate::strategies::{Strategy, TwoHopStrategy};
+use crate::strategies::{self, Strategy};
 use crate::types::{PriceData, Route, TradeRecord};
 
 pub const TRADE_LOG_PATH: &str = "data/trades.json";
@@ -72,7 +72,16 @@ pub struct ArbitrageBot {
 }
 
 impl ArbitrageBot {
-    pub fn new(mode: ExecutionMode, network: Network, trade_size_lamports: u64) -> Result<Self> {
+    /// Build a bot running the named strategy.
+    ///
+    /// Strategies are resolved through [`strategies::build`], so adding one
+    /// requires no change here.
+    pub fn new(
+        mode: ExecutionMode,
+        network: Network,
+        trade_size_lamports: u64,
+        strategy_name: &str,
+    ) -> Result<Self> {
         let wallet_path = CONFIG
             .wallet_path
             .clone()
@@ -97,14 +106,17 @@ impl ArbitrageBot {
             },
         );
 
+        let strategy = strategies::build(
+            strategy_name,
+            CONFIG.min_profit_percentage,
+            CONFIG.priority_fee_microlamports,
+        )?;
+
         Ok(Self {
             connection,
             wallet_pubkey,
             start_time: Utc::now(),
-            strategies: vec![Box::new(TwoHopStrategy::new(
-                CONFIG.min_profit_percentage,
-                CONFIG.priority_fee_microlamports,
-            ))],
+            strategies: vec![strategy],
             execution_engine,
             price_source,
             ledger: TradeLedger::load(TRADE_LOG_PATH)?,
@@ -220,11 +232,19 @@ impl ArbitrageBot {
         };
 
         println!(
-            "Opportunity: {} | in {:.6} SOL -> out {:.6} SOL | net {:+.6} SOL ({:+.3}%)",
+            "Opportunity [{}]: {} | in {:.6} SOL -> out {:.6} SOL",
+            route.strategy,
             route.label,
             lamports_to_sol(route.amount_in),
             lamports_to_sol(route.amount_out),
-            route.net_profit as f64 / crate::config::LAMPORTS_PER_SOL as f64,
+        );
+        println!(
+            "  gross {:+} lamports - costs {} (base {} + priority {}) = net {:+} lamports ({:+.3}%)",
+            route.gross_profit,
+            route.costs.total_lamports(),
+            route.costs.base_fee_lamports,
+            route.costs.priority_fee_lamports,
+            route.net_profit,
             route.expected_profit
         );
 
@@ -267,14 +287,26 @@ impl ArbitrageBot {
             _ => None,
         };
 
+        // Snapshot the caps as they were when this trade was judged; config
+        // can change, and a log entry must stay interpretable afterwards.
+        let caps = self
+            .execution_engine
+            .limits()
+            .snapshot(self.ledger.cumulative_loss_lamports());
+
         self.status.total_trades += 1;
         self.ledger.append(TradeRecord {
             timestamp: Utc::now().to_rfc3339(),
             mode: self.mode.to_string(),
+            strategy: route.strategy.to_string(),
             label: route.label.clone(),
             amount_in: route.amount_in,
             expected_out: route.amount_out,
+            gross_profit: route.gross_profit,
+            net_profit: route.net_profit,
             expected_profit_pct: route.expected_profit,
+            costs: route.costs,
+            caps,
             realised_profit: realised,
             signature,
             outcome: outcome_label,

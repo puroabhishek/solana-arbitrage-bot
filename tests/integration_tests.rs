@@ -11,7 +11,8 @@ use solana_arbitrage_bot::{
         SafetyLimits,
     },
     prices::{MockPriceSource, PriceSource, RoundTrip, SOL, USDC},
-    strategies::{Strategy, TwoHopStrategy},
+    strategies::{self, Strategy, TradeCosts, TwoHopStrategy},
+    types::CapSnapshot,
 };
 use solana_sdk::signature::Keypair;
 
@@ -126,6 +127,66 @@ async fn rehearse_needs_no_caps_since_it_spends_no_real_funds() {
     assert_eq!(e.check_limits(ExecutionMode::Rehearse, u64::MAX, 0), None);
 }
 
+#[tokio::test]
+async fn strategy_is_resolved_by_name_and_tagged_on_the_route() -> Result<()> {
+    // The bot only ever talks to the trait, so a strategy can be swapped in
+    // by name without touching detection, execution or logging.
+    let strategy = strategies::build("two-hop", 0.0, 1_000)?;
+    assert_eq!(strategy.name(), "two-hop");
+
+    let rt = round_trip(0.15, 6.8, sol_to_lamports(1.0)).await?;
+    let routes = strategy.find_opportunities(&[rt]).await?;
+    assert_eq!(routes.len(), 1);
+
+    // Every route carries its origin, so the trade log can attribute it.
+    assert_eq!(routes[0].strategy, "two-hop");
+    Ok(())
+}
+
+#[test]
+fn unknown_strategy_is_rejected_with_a_useful_message() {
+    let err = match strategies::build("multi-exchange", 1.0, 1_000) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an unimplemented strategy must not silently build"),
+    };
+    assert!(err.contains("unknown strategy"));
+    assert!(err.contains("two-hop"), "should list what is available");
+}
+
+#[tokio::test]
+async fn route_records_full_cost_breakdown() -> Result<()> {
+    let strategy = strategies::build("two-hop", 0.0, 1_000)?;
+    let rt = round_trip(0.15, 6.8, sol_to_lamports(1.0)).await?;
+    let routes = strategy.find_opportunities(&[rt]).await?;
+    let route = &routes[0];
+
+    // Costs must be itemised, not just totalled, so a rejection is auditable.
+    assert_eq!(route.costs.base_fee_lamports, 5_000);
+    assert_eq!(route.costs.priority_fee_lamports, 400); // 1000 micro * 400k CU / 1e6
+    assert_eq!(route.costs.total_lamports(), 5_400);
+    assert_eq!(route.costs.compute_units, 400_000);
+
+    // And the arithmetic linking gross, costs and net must hold exactly.
+    assert_eq!(
+        route.net_profit,
+        route.gross_profit - route.costs.total_lamports() as i64
+    );
+    Ok(())
+}
+
+#[test]
+fn cap_snapshot_captures_limits_in_force() {
+    let limits = SafetyLimits {
+        max_spend_lamports: Some(sol_to_lamports(0.05)),
+        max_cumulative_loss_lamports: Some(sol_to_lamports(0.1)),
+    };
+    let snap = limits.snapshot(sol_to_lamports(0.02));
+
+    assert_eq!(snap.max_spend_lamports, Some(sol_to_lamports(0.05)));
+    assert_eq!(snap.max_cumulative_loss_lamports, Some(sol_to_lamports(0.1)));
+    assert_eq!(snap.cumulative_loss_at_evaluation, sol_to_lamports(0.02));
+}
+
 #[test]
 fn modes_imply_sensible_networks() {
     // Rehearsal is devnet by definition; real trading needs mainnet liquidity.
@@ -146,10 +207,19 @@ fn ledger_loss_survives_reload() -> Result<()> {
     ledger.append(TradeRecord {
         timestamp: "2026-01-01T00:00:00Z".into(),
         mode: "live".into(),
+        strategy: "two-hop".into(),
         label: "SOL/USDC".into(),
         amount_in: sol_to_lamports(0.01),
         expected_out: sol_to_lamports(0.011),
+        gross_profit: sol_to_lamports(0.001) as i64,
+        net_profit: sol_to_lamports(0.0009) as i64,
         expected_profit_pct: 1.0,
+        costs: TradeCosts::estimate(1, 1_000, 400_000),
+        caps: CapSnapshot {
+            max_spend_lamports: Some(sol_to_lamports(0.05)),
+            max_cumulative_loss_lamports: Some(sol_to_lamports(0.1)),
+            cumulative_loss_at_evaluation: 0,
+        },
         realised_profit: Some(-(sol_to_lamports(0.002) as i64)),
         signature: None,
         outcome: "submitted".into(),
