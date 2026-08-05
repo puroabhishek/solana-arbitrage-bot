@@ -61,6 +61,8 @@ enum Commands {
     },
     /// List available strategies
     Strategies,
+    /// Send a test alert, to check notification setup
+    TestAlert,
 }
 
 pub struct BotInterface;
@@ -101,6 +103,7 @@ impl BotInterface {
                 }
                 Ok(())
             }
+            Commands::TestAlert => Self::test_alert().await,
         }
     }
 
@@ -201,6 +204,71 @@ impl BotInterface {
             .default(false)
             .interact()
             .context("reading confirmation")
+    }
+
+    /// Send one test alert and report precisely what happened.
+    ///
+    /// Isolates notification setup from everything else: no wallet, no RPC and
+    /// no price source are touched, so a failure here is unambiguously a
+    /// notification problem.
+    async fn test_alert() -> Result<()> {
+        use crate::notify::{DiscordNotifier, Level, Notification, Notifier};
+
+        let url = match &CONFIG.discord_webhook_url {
+            Some(u) => u,
+            None => {
+                println!("DISCORD_WEBHOOK_URL is not set in .env — alerts are disabled.");
+                println!();
+                println!("To enable them:");
+                println!("  1. In Discord, open a server you own (create one if needed:");
+                println!("     the '+' button in the left sidebar -> Create My Own).");
+                println!("  2. Right-click a text channel -> Edit Channel -> Integrations");
+                println!("     -> Webhooks -> New Webhook -> Copy Webhook URL.");
+                println!("  3. Add to .env:  DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...");
+                println!();
+                println!("Webhook creation needs the Manage Webhooks permission, which you");
+                println!("have automatically in a server you created.");
+                return Ok(());
+            }
+        };
+
+        // Show enough to confirm it is the intended webhook, without printing
+        // the token part to a terminal or a screenshare.
+        let redacted: String = url.chars().take(45).collect();
+        println!("Webhook: {}…", redacted);
+        println!("Sending test alert…");
+
+        let notifier = DiscordNotifier::new(url.clone())?;
+        match notifier
+            .send(
+                &Notification::new(
+                    Level::Info,
+                    "Test alert",
+                    "If you can see this in Discord, notifications are working.",
+                )
+                .field("Source", "solana-arbitrage-bot")
+                .field("Command", "test-alert"),
+            )
+            .await
+        {
+            Ok(()) => {
+                println!("Sent. Check your Discord channel.");
+                println!();
+                println!("Nothing there? The webhook URL probably points at a different");
+                println!("channel than the one you are looking at.");
+            }
+            Err(e) => {
+                println!("Failed: {}", e);
+                println!();
+                println!("Common causes:");
+                println!("  401/404  the webhook was deleted, or the URL is truncated —");
+                println!("           re-copy it from Discord (it must end with a long token)");
+                println!("  403      the webhook lacks permission to post in that channel");
+                println!("  timeout  no network route to discord.com from this machine");
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     fn show_history() -> Result<()> {

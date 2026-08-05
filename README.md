@@ -218,17 +218,56 @@ The bot can post to a Discord channel so you do not have to watch a terminal.
 It uses an **incoming webhook** — no bot token, no OAuth, no persistent gateway
 connection, just an HTTPS POST.
 
-Setup:
+### Setup
 
-1. In Discord: **channel → Edit Channel → Integrations → Webhooks → New
-   Webhook**, then **Copy Webhook URL**.
-2. Put it in `.env`:
+**You must own or admin the server.** Webhooks are created from a server's own
+settings, so if your account only *joins* other people's servers there will be
+no Integrations menu to find. Making your own server is free and instant.
+
+Also note: **webhook creation is desktop/browser only.** The Discord mobile app
+does not expose it.
+
+1. **Have a server you own.** In the left sidebar click **`+`** →
+   **Create My Own** → skip the questions → name it anything. You are now its
+   owner, which grants Manage Webhooks automatically.
+2. **Pick or create a text channel** in that server (e.g. `#bot-alerts`).
+3. **Hover the channel → ⚙ Edit Channel → Integrations → Webhooks →
+   New Webhook.**
+4. Click the webhook, then **Copy Webhook URL**. It looks like:
+   ```
+   https://discord.com/api/webhooks/1234567890123456789/AbCdEf-long_token_here
+   ```
+   Both the numeric ID *and* the long token after it are required — a
+   truncated copy fails with 401 or 404.
+5. **Put it in `.env`:**
    ```
    DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/.../...
    ```
+6. **Verify it:**
+   ```bash
+   cargo run -- test-alert
+   ```
+   This touches no wallet, RPC or price source, so anything that goes wrong is
+   unambiguously a notification problem. It prints the specific cause on
+   failure.
 
 Treat that URL as a secret — anyone holding it can post to your channel. Leave
 it unset to disable alerts.
+
+<details>
+<summary>Testing the webhook without the bot</summary>
+
+To rule the bot out entirely, post to the webhook directly:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"content":"hello from curl"}' \
+  "https://discord.com/api/webhooks/.../..."
+```
+
+A `204 No Content` means the webhook is good and the problem is configuration.
+A `401`/`404` means the URL is wrong, truncated, or the webhook was deleted.
+</details>
 
 You get pinged for:
 
