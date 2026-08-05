@@ -28,7 +28,7 @@ echo "    rust:   $(rustc --version)"
 
 if ! command -v solana-keygen >/dev/null 2>&1; then
     warn "Solana CLI not found. Install it, then re-run this script:"
-    warn "  sh -c \"\$(curl -sSfL https://release.solana.com/stable/install)\""
+    warn "  sh -c \"\$(curl -sSfL https://release.anza.xyz/stable/install)\""
     warn ""
     warn "You can continue without it only if you already have a keypair file."
     exit 1

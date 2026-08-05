@@ -2,7 +2,7 @@
 set -e
 
 # Install Solana CLI
-sh -c "$(curl -sSfL https://release.solana.com/v1.17.0/install)"
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
 
 # Install Rust if not installed
 if ! command -v rustc &> /dev/null; then
