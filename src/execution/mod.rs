@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::transaction::VersionedTransaction;
 
+pub mod compose;
 pub mod ledger;
 pub mod mev_builder;
 pub mod transaction_builder;
@@ -28,6 +29,9 @@ pub enum Refusal {
     LossCapReached { lost: u64, cap: u64 },
     /// Simulation against the cluster failed.
     SimulationFailed(String),
+    /// The legs could not be combined into one atomic transaction, so the
+    /// round trip cannot be guaranteed.
+    NotAtomic(String),
 }
 
 impl std::fmt::Display for Refusal {
@@ -58,6 +62,11 @@ impl std::fmt::Display for Refusal {
                 lamports_to_sol(*cap)
             ),
             Refusal::SimulationFailed(e) => write!(f, "simulation failed: {}", e),
+            Refusal::NotAtomic(e) => write!(
+                f,
+                "cannot execute atomically, so refusing rather than risk a partial fill: {}",
+                e
+            ),
         }
     }
 }
@@ -191,16 +200,44 @@ impl ExecutionEngine {
             });
         }
 
-        // Simulate and live both need the real swap transaction.
-        let first = route
-            .quotes
-            .first()
-            .ok_or_else(|| anyhow!("route has no quotes; cannot build a swap"))?;
-        let encoded = source
-            .swap_transaction(first, &self.transaction_builder.pubkey().to_string())
-            .await
-            .context("fetching swap transaction from price source")?;
-        let tx = self.transaction_builder.sign_encoded_swap(&encoded)?;
+        // Simulate and live both need the real swap transaction, containing
+        // EVERY leg. Executing only the first leg would buy the intermediate
+        // token and never sell it, while reporting a round-trip profit that
+        // did not happen.
+        if route.quotes.is_empty() {
+            return Err(anyhow!("route has no quotes; cannot build a swap"));
+        }
+
+        let user = self.transaction_builder.pubkey().to_string();
+        let mut legs = Vec::with_capacity(route.quotes.len());
+        for (i, quote) in route.quotes.iter().enumerate() {
+            legs.push(
+                source
+                    .swap_instructions(quote, &user)
+                    .await
+                    .with_context(|| format!("fetching swap instructions for leg {}", i + 1))?,
+            );
+        }
+
+        let table_addresses = compose::merge_lookup_table_addresses(&legs);
+        let lookup_tables = compose::load_lookup_tables(rpc, &table_addresses)
+            .context("loading address lookup tables")?;
+
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .context("fetching recent blockhash")?;
+
+        let tx = match self
+            .transaction_builder
+            .compose_legs(&legs, &lookup_tables, blockhash)
+        {
+            Ok(tx) => tx,
+            // A round trip that cannot be made atomic must not be attempted at
+            // all — a partial fill is worse than no trade.
+            Err(e) => {
+                return Ok(ExecutionOutcome::Refused(Refusal::NotAtomic(e.to_string())))
+            }
+        };
 
         // Always simulate first, including on the live path.
         if let Err(e) = simulate(rpc, &tx) {

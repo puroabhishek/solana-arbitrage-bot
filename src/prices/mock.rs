@@ -64,6 +64,16 @@ impl PriceSource for MockPriceSource {
             "MockPriceSource cannot produce a real swap transaction; it is for tests only"
         ))
     }
+
+    async fn swap_instructions(
+        &self,
+        _quote: &Quote,
+        _user_pubkey: &str,
+    ) -> Result<super::SwapInstructions> {
+        Err(anyhow!(
+            "MockPriceSource cannot produce real swap instructions; it is for tests only"
+        ))
+    }
 }
 
 #[cfg(test)]

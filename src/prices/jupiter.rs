@@ -1,10 +1,16 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
 use serde::Deserialize;
+use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+};
+use std::str::FromStr;
 use std::time::Duration;
 
-use super::{PriceSource, Quote};
+use super::{PriceSource, Quote, SwapInstructions};
 
 /// Jupiter's aggregator API.
 ///
@@ -30,6 +36,74 @@ struct JupQuoteResponse {
 #[serde(rename_all = "camelCase")]
 struct JupSwapResponse {
     swap_transaction: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JupAccountMeta {
+    pubkey: String,
+    #[serde(rename = "isSigner")]
+    is_signer: bool,
+    #[serde(rename = "isWritable")]
+    is_writable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct JupInstruction {
+    #[serde(rename = "programId")]
+    program_id: String,
+    accounts: Vec<JupAccountMeta>,
+    /// Base64-encoded instruction data.
+    data: String,
+}
+
+impl JupInstruction {
+    fn into_instruction(self) -> Result<Instruction> {
+        let program_id = Pubkey::from_str(&self.program_id)
+            .with_context(|| format!("parsing programId '{}'", self.program_id))?;
+
+        let accounts = self
+            .accounts
+            .into_iter()
+            .map(|a| {
+                let pubkey = Pubkey::from_str(&a.pubkey)
+                    .with_context(|| format!("parsing account pubkey '{}'", a.pubkey))?;
+                Ok(AccountMeta {
+                    pubkey,
+                    is_signer: a.is_signer,
+                    is_writable: a.is_writable,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let data = BASE64
+            .decode(&self.data)
+            .context("base64-decoding instruction data")?;
+
+        Ok(Instruction {
+            program_id,
+            accounts,
+            data,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct JupSwapInstructionsResponse {
+    #[serde(default)]
+    other_instructions: Vec<JupInstruction>,
+    #[serde(default)]
+    compute_budget_instructions: Vec<JupInstruction>,
+    #[serde(default)]
+    setup_instructions: Vec<JupInstruction>,
+    swap_instruction: Option<JupInstruction>,
+    cleanup_instruction: Option<JupInstruction>,
+    #[serde(default)]
+    address_lookup_table_addresses: Vec<String>,
+}
+
+fn convert_all(items: Vec<JupInstruction>) -> Result<Vec<Instruction>> {
+    items.into_iter().map(|i| i.into_instruction()).collect()
 }
 
 pub struct JupiterPriceSource {
@@ -67,6 +141,48 @@ impl JupiterPriceSource {
             Some(key) => req.header("x-api-key", key),
             None => req,
         }
+    }
+
+    /// POST a quote to `/swap` or `/swap-instructions`, returning the raw body.
+    ///
+    /// Both endpoints take an identical request, so the shared body keeps them
+    /// from drifting apart.
+    async fn post_swap(&self, path: &str, quote: &Quote, user_pubkey: &str) -> Result<String> {
+        let quote_response = quote
+            .raw
+            .as_ref()
+            .ok_or_else(|| anyhow!("quote is missing its raw payload; cannot request a swap"))?;
+
+        let url = format!("{}/{}", self.base_url, path);
+        let body = serde_json::json!({
+            "userPublicKey": user_pubkey,
+            "quoteResponse": quote_response,
+            "wrapAndUnwrapSol": true,
+            "dynamicComputeUnitLimit": true,
+            "computeUnitPriceMicroLamports": self.priority_fee_microlamports,
+        });
+
+        let resp = self
+            .with_auth(self.client.post(&url).json(&body))
+            .send()
+            .await
+            .with_context(|| format!("requesting Jupiter /{}", path))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .with_context(|| format!("reading Jupiter /{} body", path))?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Jupiter /{} failed ({}): {}",
+                path,
+                status,
+                text.chars().take(400).collect::<String>()
+            ));
+        }
+        Ok(text)
     }
 }
 
@@ -132,40 +248,45 @@ impl PriceSource for JupiterPriceSource {
     }
 
     async fn swap_transaction(&self, quote: &Quote, user_pubkey: &str) -> Result<String> {
-        let quote_response = quote
-            .raw
-            .as_ref()
-            .ok_or_else(|| anyhow!("quote is missing its raw payload; cannot request a swap"))?;
-
-        let url = format!("{}/swap", self.base_url);
-        let body = serde_json::json!({
-            "userPublicKey": user_pubkey,
-            "quoteResponse": quote_response,
-            "wrapAndUnwrapSol": true,
-            "dynamicComputeUnitLimit": true,
-            "computeUnitPriceMicroLamports": self.priority_fee_microlamports,
-        });
-
-        let resp = self
-            .with_auth(self.client.post(&url).json(&body))
-            .send()
-            .await
-            .context("requesting Jupiter swap transaction")?;
-
-        let status = resp.status();
-        let text = resp.text().await.context("reading Jupiter swap body")?;
-
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Jupiter swap failed ({}): {}",
-                status,
-                text.chars().take(400).collect::<String>()
-            ));
-        }
-
+        let text = self.post_swap("swap", quote, user_pubkey).await?;
         let parsed: JupSwapResponse =
             serde_json::from_str(&text).context("decoding Jupiter swap schema")?;
         Ok(parsed.swap_transaction)
+    }
+
+    async fn swap_instructions(
+        &self,
+        quote: &Quote,
+        user_pubkey: &str,
+    ) -> Result<SwapInstructions> {
+        let text = self.post_swap("swap-instructions", quote, user_pubkey).await?;
+        let parsed: JupSwapInstructionsResponse =
+            serde_json::from_str(&text).context("decoding Jupiter swap-instructions schema")?;
+
+        let swap = parsed
+            .swap_instruction
+            .ok_or_else(|| anyhow!("Jupiter returned no swapInstruction"))?
+            .into_instruction()
+            .context("converting swapInstruction")?;
+
+        // `otherInstructions` runs before setup when present; keep the order
+        // Jupiter specifies rather than reordering.
+        let mut setup = convert_all(parsed.other_instructions).context("converting otherInstructions")?;
+        setup.extend(convert_all(parsed.setup_instructions).context("converting setupInstructions")?);
+
+        let cleanup = match parsed.cleanup_instruction {
+            Some(c) => vec![c.into_instruction().context("converting cleanupInstruction")?],
+            None => Vec::new(),
+        };
+
+        Ok(SwapInstructions {
+            compute_budget: convert_all(parsed.compute_budget_instructions)
+                .context("converting computeBudgetInstructions")?,
+            setup,
+            swap,
+            cleanup,
+            address_lookup_tables: parsed.address_lookup_table_addresses,
+        })
     }
 }
 

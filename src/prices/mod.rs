@@ -149,6 +149,28 @@ impl RoundTrip {
     }
 }
 
+/// A swap expressed as instructions rather than a finished transaction.
+///
+/// This is what makes atomic arbitrage possible: a pre-built transaction can
+/// only ever hold one leg, whereas instructions from two legs can be composed
+/// into a single transaction that either completes the whole round trip or
+/// reverts entirely.
+#[derive(Debug, Clone)]
+pub struct SwapInstructions {
+    /// Compute budget instructions. Discarded when composing legs — the
+    /// combined transaction needs one budget covering both, not two.
+    pub compute_budget: Vec<solana_sdk::instruction::Instruction>,
+    /// Account creation / wSOL wrapping that must run before the swap.
+    pub setup: Vec<solana_sdk::instruction::Instruction>,
+    /// The swap itself.
+    pub swap: solana_sdk::instruction::Instruction,
+    /// Account closing / unwrapping. Deferred to the end of the composed
+    /// transaction so leg 2 can still use accounts leg 1 set up.
+    pub cleanup: Vec<solana_sdk::instruction::Instruction>,
+    /// Address lookup tables this leg's accounts are drawn from.
+    pub address_lookup_tables: Vec<String>,
+}
+
 /// Where quotes and swap transactions come from.
 ///
 /// Prices are always real and live in every execution mode — the mock
@@ -162,5 +184,16 @@ pub trait PriceSource: Send + Sync {
 
     /// Fetch a ready-to-sign swap transaction for a quote, as returned by the
     /// provider. Returned base64-encoded exactly as the provider encodes it.
+    ///
+    /// Single-leg only. Prefer [`swap_instructions`](Self::swap_instructions)
+    /// for arbitrage, which needs both legs in one transaction.
     async fn swap_transaction(&self, quote: &Quote, user_pubkey: &str) -> Result<String>;
+
+    /// Fetch a swap as composable instructions, so multiple legs can share one
+    /// atomic transaction.
+    async fn swap_instructions(
+        &self,
+        quote: &Quote,
+        user_pubkey: &str,
+    ) -> Result<SwapInstructions>;
 }
