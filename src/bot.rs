@@ -307,6 +307,14 @@ impl ArbitrageBot {
             route.net_profit, route.expected_profit, route.net_profit_expected
         );
 
+        // Balance before, so realised profit can be measured rather than
+        // assumed. Only meaningful when we are actually going to submit.
+        let balance_before = if self.mode.submits() {
+            self.connection.get_balance(&self.wallet_pubkey).ok()
+        } else {
+            None
+        };
+
         let outcome = self
             .execution_engine
             .execute_route(
@@ -318,11 +326,27 @@ impl ArbitrageBot {
             )
             .await?;
 
-        self.record(&route, &outcome).await?;
+        self.record(&route, &outcome, balance_before).await?;
         Ok(())
     }
 
-    async fn record(&mut self, route: &Route, outcome: &ExecutionOutcome) -> Result<()> {
+    /// Measure what a submitted trade actually did to the wallet.
+    ///
+    /// Storing the pre-trade estimate as "realised" profit makes the
+    /// cumulative-loss cap unable to see slippage, failed legs or fees — the
+    /// prediction can never disagree with itself. Only the balance delta can.
+    fn measure_realised(&self, before: Option<u64>) -> Option<i64> {
+        let before = before?;
+        let after = self.connection.get_balance(&self.wallet_pubkey).ok()?;
+        Some(after as i64 - before as i64)
+    }
+
+    async fn record(
+        &mut self,
+        route: &Route,
+        outcome: &ExecutionOutcome,
+        balance_before: Option<u64>,
+    ) -> Result<()> {
         let (outcome_label, signature) = match outcome {
             ExecutionOutcome::Detected => ("detected".to_string(), None),
             ExecutionOutcome::Simulated => {
@@ -333,16 +357,39 @@ impl ArbitrageBot {
                 println!("  submitted: {}", signature);
                 ("submitted".to_string(), Some(signature.clone()))
             }
+            ExecutionOutcome::SubmissionFailed {
+                error,
+                cost_lamports,
+            } => {
+                if *cost_lamports == 0 {
+                    println!("  did not land (no cost): {}", error);
+                } else {
+                    println!("  did not land, cost {} lamports: {}", cost_lamports, error);
+                }
+                (format!("submission failed: {}", error), None)
+            }
             ExecutionOutcome::Refused(r) => {
                 println!("  refused: {}", r);
                 (format!("refused: {}", r), None)
             }
         };
 
-        // Only a confirmed submission has a realised result; everything else
-        // must stay None so it cannot skew the loss cap.
+        // Realised profit must come from the chain, not from the estimate that
+        // authorised the trade — otherwise the loss cap can never disagree
+        // with the prediction and will never trip.
         let realised = match outcome {
-            ExecutionOutcome::Submitted { .. } => Some(route.net_profit),
+            ExecutionOutcome::Submitted { .. } => {
+                let measured = self.measure_realised(balance_before);
+                if measured.is_none() {
+                    log::warn!("could not measure realised profit; balance read failed");
+                }
+                measured
+            }
+            // A failed attempt's cost is a real loss, even though no trade
+            // happened. Zero-cost misses are recorded as zero, not ignored.
+            ExecutionOutcome::SubmissionFailed { cost_lamports, .. } => {
+                Some(-(*cost_lamports as i64))
+            }
             _ => None,
         };
 
@@ -397,6 +444,15 @@ impl ArbitrageBot {
             ExecutionOutcome::Detected => (Level::Info, "Opportunity detected"),
             ExecutionOutcome::Simulated => (Level::Notable, "Simulated OK"),
             ExecutionOutcome::Submitted { .. } => (Level::Notable, "Trade submitted"),
+            // A free miss is routine on the bundle path; one that cost money
+            // is worth attention.
+            ExecutionOutcome::SubmissionFailed { cost_lamports, .. } => {
+                if *cost_lamports == 0 {
+                    (Level::Info, "Did not land (no cost)")
+                } else {
+                    (Level::Alert, "Submission failed, fee paid")
+                }
+            }
             ExecutionOutcome::Refused(Refusal::LossCapReached { .. }) => {
                 (Level::Alert, "HALTED: loss cap reached")
             }

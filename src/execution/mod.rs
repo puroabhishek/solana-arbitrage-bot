@@ -80,6 +80,12 @@ pub enum ExecutionOutcome {
     Simulated,
     /// Actually submitted and confirmed.
     Submitted { signature: String },
+    /// Submitted but did not land.
+    ///
+    /// Distinguishes the two cases that differ entirely in cost: a bundle that
+    /// lost its auction commits nothing and costs nothing, while a naked
+    /// transaction that reverted still burnt the fee.
+    SubmissionFailed { error: String, cost_lamports: u64 },
     /// Deliberately not submitted, with a named reason.
     Refused(Refusal),
 }
@@ -292,22 +298,31 @@ impl ExecutionEngine {
             return Ok(ExecutionOutcome::Simulated);
         }
 
-        // Bundle path: atomic, and an unselected bundle costs nothing.
+        // A submission failure must be reported, not propagated: letting `?`
+        // escape here skips recording entirely, so burnt fees never reach the
+        // loss cap and the most common real loss stays invisible.
         if let Some(client) = &self.bundles {
-            let bundle_id = client
-                .send_bundle(std::slice::from_ref(&tx))
-                .await
-                .context("submitting bundle")?;
-            return Ok(ExecutionOutcome::Submitted {
-                signature: bundle_id,
+            return Ok(match client.send_bundle(std::slice::from_ref(&tx)).await {
+                Ok(bundle_id) => ExecutionOutcome::Submitted {
+                    signature: bundle_id,
+                },
+                // An unselected or rejected bundle commits nothing on-chain.
+                Err(e) => ExecutionOutcome::SubmissionFailed {
+                    error: e.to_string(),
+                    cost_lamports: 0,
+                },
             });
         }
 
-        let sig = rpc
-            .send_and_confirm_transaction(&tx)
-            .context("submitting swap transaction")?;
-        Ok(ExecutionOutcome::Submitted {
-            signature: sig.to_string(),
+        Ok(match rpc.send_and_confirm_transaction(&tx) {
+            Ok(sig) => ExecutionOutcome::Submitted {
+                signature: sig.to_string(),
+            },
+            // A naked transaction that reverted still paid its fee.
+            Err(e) => ExecutionOutcome::SubmissionFailed {
+                error: e.to_string(),
+                cost_lamports: route.costs.total_lamports(),
+            },
         })
     }
 }

@@ -63,6 +63,8 @@ enum Commands {
     Strategies,
     /// Send a test alert, to check notification setup
     TestAlert,
+    /// Show minimum viable trade size and profit for the current settings
+    Breakeven,
 }
 
 pub struct BotInterface;
@@ -104,6 +106,25 @@ impl BotInterface {
                 Ok(())
             }
             Commands::TestAlert => Self::test_alert().await,
+            Commands::Breakeven => {
+                // Uses the same cost model the strategy does, so this is the
+                // real arithmetic rather than a separate approximation.
+                let costs = crate::strategies::TradeCosts::estimate(
+                    1,
+                    CONFIG.priority_fee_microlamports,
+                    crate::execution::transaction_builder::DEFAULT_COMPOSED_COMPUTE_UNITS as u64,
+                );
+                println!(
+                    "{}",
+                    crate::breakeven::report(
+                        CONFIG.slippage_bps,
+                        costs.total_lamports(),
+                        CONFIG.min_profit_percentage,
+                        CONFIG.use_jito_bundles,
+                    )
+                );
+                Ok(())
+            }
         }
     }
 

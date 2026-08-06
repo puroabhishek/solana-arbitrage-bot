@@ -348,6 +348,52 @@ cargo run -- start > bot.log 2>&1    # to a file
 Prices also land in the trade log whenever an opportunity is found, and
 `cargo run -- history` shows them per leg under **Path (buy @ / sell @)**.
 
+## Choosing your thresholds
+
+Run this before setting anything:
+
+```bash
+cargo run -- breakeven
+```
+
+It prints the minimum viable edge and trade size for your actual settings,
+using the same cost model the strategy does.
+
+Two relationships decide everything:
+
+```
+minimum edge:  p_min = 2σ + F / (w × S)
+minimum size:  S_min = F / (w × (p − 2σ))
+
+σ = slippage per leg   F = fixed cost   w = win rate   S = trade size
+```
+
+**Slippage sets an irreducible floor.** A round trip has two legs and each may
+fill up to the tolerance worse than quoted, so `2 × SLIPPAGE_BPS` is lost before
+any fee. At the default 50 bps that floor is **1%** — and an edge below it is
+impossible at *any* trade size. The bot refuses to start if
+`MIN_PROFIT_PERCENTAGE` does not clear it.
+
+**Fixed costs decide minimum size**, because they do not scale with the trade.
+They dominate small trades and vanish on large ones.
+
+**Jito bundles change the arithmetic entirely.** Solana charges fees whether a
+transaction succeeds or fails, so on the naked path every lost race is a direct
+bleed. A bundle that loses its auction commits nothing and costs nothing — which
+means `w = 1` for cost purposes, and slippage can be set tight because a revert
+is free.
+
+| Setting | Suggested | Why |
+| --- | --- | --- |
+| `USE_JITO_BUNDLES` | `true` (default) | Atomic, and lost races are free |
+| `SLIPPAGE_BPS` | 10–20 | Tight is affordable once reverts cost nothing |
+| `MIN_PROFIT_PERCENTAGE` | 0.5 | Clears the 0.2–0.4% floor with margin |
+| Trade size | ≥ 0.05 SOL | Keeps fixed costs immaterial |
+
+Tightening slippage from 50 to 10 bps turns a 0.25% edge from *impossible at any
+size* into viable at ~0.011 SOL. That single setting matters more than any
+other.
+
 ## Understanding the numbers
 
 Amounts are in **lamports**, the smallest unit of SOL:
@@ -381,12 +427,17 @@ for every trade, so any decision can be audited after the fact:
   scaffolding, not wired into the execution path.
 - **Only two-hop (`A -> B -> A`) routes** are implemented. Triangular routes
   across three tokens are not — see [Adding one](#adding-one).
-- **Realised profit is recorded as the expected value**, not measured from
-  post-trade balances, so the loss cap is an estimate rather than a settled
-  accounting of what actually happened on-chain.
-- **Costs are estimated, not actual.** The logged fee breakdown uses an assumed
-  400,000 compute units; the real transaction's compute usage and the network's
-  prevailing priority fee at submission time may differ.
+- **Token accounts are not pre-created.** The first trade into a token pays
+  ~0.00204 SOL of ATA rent. It is a refundable deposit rather than a fee, and
+  Jupiter creates the account automatically, but it is working capital tied up
+  until you close the account.
+- **Bundle landing is not confirmed.** `sendBundle` returns a bundle ID; the bot
+  does not yet poll `getBundleStatuses` to confirm the bundle landed, so a
+  submitted-but-unselected bundle is recorded from the submission response
+  rather than from observed on-chain state.
+- **Compute budget is a fixed 600,000 units** for a composed two-leg swap rather
+  than derived per route. Priority fee is charged on the requested limit, so an
+  over-request costs real money.
 - Only `SOL/USDC` and `SOL/USDT` are scanned; the pair list is a compile-time
   constant in `src/prices/mod.rs`.
 
