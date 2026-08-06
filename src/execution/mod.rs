@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::transaction::VersionedTransaction;
 
+pub mod bundle;
 pub mod compose;
 pub mod ledger;
 pub mod mev_builder;
@@ -102,6 +103,9 @@ impl SafetyLimits {
 pub struct ExecutionEngine {
     transaction_builder: TransactionBuilder,
     limits: SafetyLimits,
+    /// Set to submit atomic bundles instead of naked transactions.
+    bundles: Option<bundle::BundleClient>,
+    tip_percentile: bundle::TipPercentile,
 }
 
 impl ExecutionEngine {
@@ -109,7 +113,23 @@ impl ExecutionEngine {
         Self {
             transaction_builder,
             limits,
+            bundles: None,
+            tip_percentile: bundle::TipPercentile::P50,
         }
+    }
+
+    pub fn with_bundles(
+        mut self,
+        client: bundle::BundleClient,
+        tip_percentile: bundle::TipPercentile,
+    ) -> Self {
+        self.bundles = Some(client);
+        self.tip_percentile = tip_percentile;
+        self
+    }
+
+    pub fn uses_bundles(&self) -> bool {
+        self.bundles.is_some()
     }
 
     pub fn builder(&self) -> &TransactionBuilder {
@@ -227,9 +247,31 @@ impl ExecutionEngine {
             .get_latest_blockhash()
             .context("fetching recent blockhash")?;
 
+        // Only tip when actually submitting a bundle: a tip in a simulation
+        // would distort the compute and balance figures for no benefit.
+        let tip = match (&self.bundles, mode) {
+            (Some(client), ExecutionMode::Live) => {
+                let lamports = match client.tip_floor().await {
+                    Ok(floor) => floor.lamports_for(self.tip_percentile),
+                    // A missing tip feed must not block trading; fall back to
+                    // the documented minimum and say so.
+                    Err(e) => {
+                        log::warn!(
+                            "tip floor unavailable ({}), falling back to minimum {} lamports",
+                            e,
+                            bundle::MIN_TIP_LAMPORTS
+                        );
+                        bundle::MIN_TIP_LAMPORTS
+                    }
+                };
+                Some((bundle::BundleClient::random_tip_account()?, lamports))
+            }
+            _ => None,
+        };
+
         let tx = match self
             .transaction_builder
-            .compose_legs(&legs, &lookup_tables, blockhash)
+            .compose_legs(&legs, &lookup_tables, blockhash, tip)
         {
             Ok(tx) => tx,
             // A round trip that cannot be made atomic must not be attempted at
@@ -248,6 +290,17 @@ impl ExecutionEngine {
 
         if mode == ExecutionMode::Simulate {
             return Ok(ExecutionOutcome::Simulated);
+        }
+
+        // Bundle path: atomic, and an unselected bundle costs nothing.
+        if let Some(client) = &self.bundles {
+            let bundle_id = client
+                .send_bundle(std::slice::from_ref(&tx))
+                .await
+                .context("submitting bundle")?;
+            return Ok(ExecutionOutcome::Submitted {
+                signature: bundle_id,
+            });
         }
 
         let sig = rpc

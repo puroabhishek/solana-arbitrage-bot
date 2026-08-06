@@ -143,6 +143,15 @@ pub struct Config {
     pub wallet_path: Option<String>,
     /// Discord incoming-webhook URL. Unset disables notifications entirely.
     pub discord_webhook_url: Option<String>,
+    /// Submit via Jito bundles rather than a naked transaction.
+    ///
+    /// Defaults on: a bundle is atomic across both legs, and an unselected
+    /// bundle commits nothing and therefore costs nothing, where a reverted
+    /// naked transaction still burns the fee.
+    pub use_jito_bundles: bool,
+    pub jito_block_engine_url: String,
+    /// Which landed-tip percentile to pay.
+    pub jito_tip_percentile: String,
 }
 
 impl Config {
@@ -235,6 +244,13 @@ lazy_static! {
             poll_interval_secs: env_parse("POLL_INTERVAL_SECS", 10),
             wallet_path: env_opt("WALLET_PATH"),
             discord_webhook_url: env_opt("DISCORD_WEBHOOK_URL"),
+            use_jito_bundles: env_opt("USE_JITO_BUNDLES")
+                .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
+            jito_block_engine_url: env_opt("JITO_BLOCK_ENGINE_URL")
+                .unwrap_or_else(|| crate::execution::bundle::DEFAULT_BLOCK_ENGINE.to_string()),
+            jito_tip_percentile: env_opt("JITO_TIP_PERCENTILE")
+                .unwrap_or_else(|| "50".to_string()),
         }
     };
 }
@@ -285,6 +301,9 @@ mod tests {
             poll_interval_secs: 10,
             wallet_path: None,
             discord_webhook_url: None,
+            use_jito_bundles: true,
+            jito_block_engine_url: crate::execution::bundle::DEFAULT_BLOCK_ENGINE.to_string(),
+            jito_tip_percentile: "50".to_string(),
         }
     }
 

@@ -103,13 +103,25 @@ impl ArbitrageBot {
             CONFIG.priority_fee_microlamports,
         )?);
 
-        let execution_engine = ExecutionEngine::new(
+        let mut execution_engine = ExecutionEngine::new(
             TransactionBuilder::new(wallet, CONFIG.priority_fee_microlamports),
             SafetyLimits {
                 max_spend_lamports: CONFIG.max_spend_lamports,
                 max_cumulative_loss_lamports: CONFIG.max_cumulative_loss_lamports,
             },
         );
+
+        // Bundles are the default: they make the round trip atomic, and an
+        // unselected bundle costs nothing where a reverted naked transaction
+        // still burns the fee.
+        if CONFIG.use_jito_bundles {
+            let percentile = CONFIG
+                .jito_tip_percentile
+                .parse::<crate::execution::bundle::TipPercentile>()?;
+            let client =
+                crate::execution::bundle::BundleClient::new(CONFIG.jito_block_engine_url.clone())?;
+            execution_engine = execution_engine.with_bundles(client, percentile);
+        }
 
         let strategy = strategies::build(
             strategy_name,

@@ -109,6 +109,7 @@ pub fn order_instructions(
     legs: &[SwapInstructions],
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
+    tip: Option<(Pubkey, Pubkey, u64)>,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
 
@@ -129,6 +130,13 @@ pub fn order_instructions(
         out.extend(leg.cleanup.iter().cloned());
     }
 
+    // The tip goes inside the same transaction as the swaps, so it is paid
+    // only if the whole round trip succeeds. A tip in a separate transaction
+    // could land while the arbitrage failed, turning a free miss into a cost.
+    if let Some((from, to, lamports)) = tip {
+        out.push(solana_sdk::system_instruction::transfer(&from, &to, lamports));
+    }
+
     out
 }
 
@@ -145,6 +153,7 @@ pub fn compose_atomic_transaction(
     recent_blockhash: Hash,
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
+    tip: Option<(Pubkey, u64)>,
 ) -> Result<VersionedTransaction> {
     use solana_sdk::signer::Signer;
 
@@ -155,10 +164,12 @@ pub fn compose_atomic_transaction(
         }));
     }
 
+    let tip = tip.map(|(to, lamports)| (payer.pubkey(), to, lamports));
     let instructions = order_instructions(
         legs,
         compute_unit_limit,
         compute_unit_price_micro_lamports,
+        tip,
     );
 
     let message = v0::Message::try_compile(
@@ -213,7 +224,7 @@ mod tests {
     #[test]
     fn setups_precede_swaps_and_cleanup_is_last() {
         let legs = vec![leg(1, &[]), leg(2, &[])];
-        let out = order_instructions(&legs, 400_000, 1_000);
+        let out = order_instructions(&legs, 400_000, 1_000, None);
 
         let tags: Vec<u8> = out.iter().map(|i| i.data[0]).collect();
         // First two are compute budget (their data is not our tags).
@@ -229,7 +240,7 @@ mod tests {
         // one silently wins — capping the combined transaction at one leg's
         // budget.
         let legs = vec![leg(1, &[]), leg(2, &[])];
-        let out = order_instructions(&legs, 400_000, 1_000);
+        let out = order_instructions(&legs, 400_000, 1_000, None);
 
         let tags: Vec<u8> = out.iter().map(|i| i.data[0]).collect();
         assert!(!tags.contains(&201), "leg 1 budget must not be carried over");
@@ -239,13 +250,46 @@ mod tests {
     #[test]
     fn compute_budget_is_set_once_at_the_front() {
         let legs = vec![leg(1, &[]), leg(2, &[])];
-        let out = order_instructions(&legs, 400_000, 1_000);
+        let out = order_instructions(&legs, 400_000, 1_000, None);
 
         let budget_program = solana_sdk::compute_budget::id();
         let budget_count = out.iter().filter(|i| i.program_id == budget_program).count();
         assert_eq!(budget_count, 2, "exactly one limit + one price instruction");
         assert_eq!(out[0].program_id, budget_program);
         assert_eq!(out[1].program_id, budget_program);
+    }
+
+    #[test]
+    fn tip_rides_inside_the_same_transaction_as_the_swaps() {
+        // The tip must share the swaps' fate. In a separate transaction it
+        // could land while the arbitrage failed, turning a free miss into a
+        // paid one — which would forfeit the main reason to use bundles.
+        let legs = vec![leg(1, &[]), leg(2, &[])];
+        let payer = Pubkey::new_unique();
+        let tip_account = Pubkey::new_unique();
+
+        let out = order_instructions(&legs, 400_000, 1_000, Some((payer, tip_account, 12_345)));
+
+        let system = solana_sdk::system_program::id();
+        let tip_ix = out
+            .iter()
+            .find(|i| i.program_id == system)
+            .expect("tip transfer must be present");
+
+        assert!(tip_ix.accounts.iter().any(|a| a.pubkey == tip_account));
+        // Last, so it only runs once the swaps have succeeded.
+        assert_eq!(out.last().unwrap().program_id, system);
+    }
+
+    #[test]
+    fn no_tip_instruction_when_not_bundling() {
+        let legs = vec![leg(1, &[])];
+        let out = order_instructions(&legs, 400_000, 1_000, None);
+        let system = solana_sdk::system_program::id();
+        assert!(
+            !out.iter().any(|i| i.program_id == system),
+            "a non-bundle submission must not pay a tip"
+        );
     }
 
     #[test]
@@ -267,6 +311,7 @@ mod tests {
             Hash::default(),
             MAX_COMPUTE_UNITS + 1,
             1_000,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("compute units"), "got: {}", err);
@@ -297,6 +342,7 @@ mod tests {
             Hash::default(),
             400_000,
             1_000,
+            None,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -317,6 +363,7 @@ mod tests {
             Hash::default(),
             400_000,
             1_000,
+            None,
         )
         .expect("two small legs should compose");
 

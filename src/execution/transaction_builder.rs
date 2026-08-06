@@ -76,11 +76,14 @@ impl TransactionBuilder {
     /// This is what makes the round trip real: both swaps land together or
     /// neither does. Returns `Err` when they will not fit, so the caller can
     /// refuse rather than execute a partial trade.
+    /// `tip` attaches a Jito tip transfer inside the same transaction, so it is
+    /// paid only if the round trip succeeds.
     pub fn compose_legs(
         &self,
         legs: &[crate::prices::SwapInstructions],
         lookup_tables: &[solana_sdk::address_lookup_table_account::AddressLookupTableAccount],
         recent_blockhash: solana_sdk::hash::Hash,
+        tip: Option<(Pubkey, u64)>,
     ) -> Result<VersionedTransaction> {
         super::compose::compose_atomic_transaction(
             legs,
@@ -89,6 +92,7 @@ impl TransactionBuilder {
             recent_blockhash,
             self.compute_unit_limit,
             self.priority_fee_microlamports,
+            tip,
         )
     }
 
