@@ -93,9 +93,19 @@ impl RoundTrip {
         self.forward.in_amount
     }
 
-    /// Base units of the starting token received back.
+    /// Base units of the starting token expected back, at the mid quote.
     pub fn amount_out(&self) -> u64 {
         self.back.out_amount
+    }
+
+    /// Base units guaranteed back in the worst case the quote allows.
+    ///
+    /// Jupiter's `otherAmountThreshold` is the minimum the swap will accept
+    /// before reverting. Judging profitability on the *expected* amount instead
+    /// means a trade can execute anywhere within slippage tolerance and still
+    /// settle at a loss, while the bot records it as a win.
+    pub fn amount_out_worst_case(&self) -> u64 {
+        self.back.other_amount_threshold
     }
 
     /// Price of the outbound leg: quote tokens per one base token.

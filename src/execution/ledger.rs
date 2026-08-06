@@ -82,8 +82,10 @@ mod tests {
             legs: Vec::new(),
             amount_in: 1_000_000,
             expected_out: 1_010_000,
+            worst_case_out: 1_005_000,
             gross_profit: 10_000,
-            net_profit: 4_600,
+            net_profit: -400,
+            net_profit_expected: 4_600,
             expected_profit_pct: 1.0,
             costs: TradeCosts::estimate(1, 1_000, 400_000),
             caps: CapSnapshot {

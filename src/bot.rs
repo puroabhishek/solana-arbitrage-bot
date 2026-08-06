@@ -84,6 +84,9 @@ impl ArbitrageBot {
         trade_size_lamports: u64,
         strategy_name: &str,
     ) -> Result<Self> {
+        // Fail fast on a configuration that could act on losing trades.
+        CONFIG.validate()?;
+
         let wallet_path = CONFIG
             .wallet_path
             .clone()
@@ -279,13 +282,17 @@ impl ArbitrageBot {
             );
         }
         println!(
-            "  gross {:+} lamports - costs {} (base {} + priority {}) = net {:+} lamports ({:+.3}%)",
+            "  gross {:+} lamports - costs {} (base {} + priority {})",
             route.gross_profit,
             route.costs.total_lamports(),
             route.costs.base_fee_lamports,
             route.costs.priority_fee_lamports,
-            route.net_profit,
-            route.expected_profit
+        );
+        // Both figures, because the gap between them is exactly how much
+        // slippage tolerance is being relied on. The decision uses the worst.
+        println!(
+            "  net: {:+} lamports worst-case ({:+.3}%)  |  {:+} expected",
+            route.net_profit, route.expected_profit, route.net_profit_expected
         );
 
         let outcome = self
@@ -343,8 +350,10 @@ impl ArbitrageBot {
             legs: route.legs.clone(),
             amount_in: route.amount_in,
             expected_out: route.amount_out,
+            worst_case_out: route.amount_out_worst_case,
             gross_profit: route.gross_profit,
             net_profit: route.net_profit,
+            net_profit_expected: route.net_profit_expected,
             expected_profit_pct: route.expected_profit,
             costs: route.costs,
             caps,

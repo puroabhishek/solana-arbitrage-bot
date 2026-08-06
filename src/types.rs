@@ -27,7 +27,8 @@ pub struct ArbitrageOpportunity {
 #[derive(Debug, Clone)]
 pub struct Route {
     pub steps: Vec<SwapStep>,
-    /// Net profit as a percentage of the amount committed, after fees.
+    /// Net profit as a percentage of the amount committed, after fees,
+    /// computed on the worst-case output. This is the decision figure.
     pub expected_profit: f64,
     /// Display label, e.g. "SOL/USDC".
     pub label: String,
@@ -35,12 +36,19 @@ pub struct Route {
     pub strategy: &'static str,
     /// Base units of the starting token committed.
     pub amount_in: u64,
-    /// Base units of the starting token expected back.
+    /// Base units of the starting token expected back, at the mid quote.
     pub amount_out: u64,
-    /// Gross difference before costs. Negative is a loss.
+    /// Base units guaranteed back in the worst case slippage allows.
+    pub amount_out_worst_case: u64,
+    /// Gross difference before costs, at the expected amount.
     pub gross_profit: i64,
-    /// Net profit in base units after transaction costs. Negative is a loss.
+    /// Net profit after costs, computed on the **worst case**. This is what
+    /// the trade decision is made on.
     pub net_profit: i64,
+    /// Net profit after costs at the expected amount, for comparison. Always
+    /// greater than or equal to `net_profit`; a wide gap means slippage
+    /// tolerance is doing a lot of work.
+    pub net_profit_expected: i64,
     /// Itemised cost of landing this trade.
     pub costs: TradeCosts,
     /// Each leg with its quoted price, for logging.
@@ -131,10 +139,16 @@ pub struct TradeRecord {
     pub legs: Vec<LegRecord>,
     pub amount_in: u64,
     pub expected_out: u64,
-    /// Difference before costs, in lamports.
+    /// Guaranteed-minimum output the decision was based on.
+    #[serde(default)]
+    pub worst_case_out: u64,
+    /// Difference before costs, in lamports, at the expected amount.
     pub gross_profit: i64,
-    /// Difference after costs, in lamports. This drives the decision.
+    /// Difference after costs on the **worst case**. This drove the decision.
     pub net_profit: i64,
+    /// Net profit at the expected amount, for comparison.
+    #[serde(default)]
+    pub net_profit_expected: i64,
     pub expected_profit_pct: f64,
     /// Itemised cost of landing the trade.
     pub costs: TradeCosts,

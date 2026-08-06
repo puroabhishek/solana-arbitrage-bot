@@ -170,10 +170,23 @@ async fn route_records_full_cost_breakdown() -> Result<()> {
     assert_eq!(route.costs.total_lamports(), 5_400);
     assert_eq!(route.costs.compute_units, 400_000);
 
-    // And the arithmetic linking gross, costs and net must hold exactly.
+    // The expected-case arithmetic must hold exactly.
+    assert_eq!(
+        route.net_profit_expected,
+        route.gross_profit - route.costs.total_lamports() as i64
+    );
+
+    // And the decision figure is the worst case, which is derived from the
+    // guaranteed-minimum output rather than the expected one.
     assert_eq!(
         route.net_profit,
-        route.gross_profit - route.costs.total_lamports() as i64
+        route.amount_out_worst_case as i64
+            - route.amount_in as i64
+            - route.costs.total_lamports() as i64
+    );
+    assert!(
+        route.net_profit <= route.net_profit_expected,
+        "the decision must never be more optimistic than expectation"
     );
     Ok(())
 }
@@ -255,8 +268,10 @@ fn ledger_loss_survives_reload() -> Result<()> {
         legs: Vec::new(),
         amount_in: sol_to_lamports(0.01),
         expected_out: sol_to_lamports(0.011),
+        worst_case_out: sol_to_lamports(0.0105),
         gross_profit: sol_to_lamports(0.001) as i64,
-        net_profit: sol_to_lamports(0.0009) as i64,
+        net_profit: sol_to_lamports(0.0004) as i64,
+        net_profit_expected: sol_to_lamports(0.0009) as i64,
         expected_profit_pct: 1.0,
         costs: TradeCosts::estimate(1, 1_000, 400_000),
         caps: CapSnapshot {

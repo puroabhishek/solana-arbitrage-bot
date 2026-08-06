@@ -18,14 +18,35 @@ const SIGNATURE_COUNT: u64 = 1;
 pub struct TwoHopStrategy {
     min_profit_percentage: f64,
     priority_fee_microlamports: u64,
+    /// Reject routes whose quoted price impact exceeds this percentage.
+    max_price_impact_pct: f64,
 }
+
+/// Default ceiling on price impact. Beyond this the trade is moving the pool
+/// against itself enough that the quoted edge is unlikely to survive.
+pub const DEFAULT_MAX_PRICE_IMPACT_PCT: f64 = 1.0;
 
 impl TwoHopStrategy {
     pub fn new(min_profit_percentage: f64, priority_fee_microlamports: u64) -> Self {
         Self {
             min_profit_percentage,
             priority_fee_microlamports,
+            max_price_impact_pct: DEFAULT_MAX_PRICE_IMPACT_PCT,
         }
+    }
+
+    pub fn with_max_price_impact(mut self, pct: f64) -> Self {
+        self.max_price_impact_pct = pct;
+        self
+    }
+
+    /// Worst price impact across the legs, as a percentage.
+    fn worst_price_impact(rt: &RoundTrip) -> f64 {
+        rt.forward
+            .price_impact_pct
+            .abs()
+            .max(rt.back.price_impact_pct.abs())
+            * 100.0
     }
 
     /// Itemised cost for one attempt, independent of trade size.
@@ -43,6 +64,9 @@ impl TwoHopStrategy {
         let cost = costs.total_lamports();
         let amount_in = rt.amount_in();
         let amount_out = rt.amount_out();
+        // Judge on what the swap guarantees, not what it hopes for. A trade
+        // can legally execute anywhere down to this figure.
+        let amount_out_worst = rt.amount_out_worst_case();
 
         let steps = vec![
             SwapStep {
@@ -88,13 +112,15 @@ impl TwoHopStrategy {
 
         Route {
             steps,
-            expected_profit: net_profit_percentage(amount_in, amount_out, cost),
+            expected_profit: net_profit_percentage(amount_in, amount_out_worst, cost),
             label: rt.label.clone(),
             strategy: STRATEGY_NAME,
             amount_in,
             amount_out,
+            amount_out_worst_case: amount_out_worst,
             gross_profit: amount_out as i64 - amount_in as i64,
-            net_profit: net_profit_lamports(amount_in, amount_out, cost),
+            net_profit: net_profit_lamports(amount_in, amount_out_worst, cost),
+            net_profit_expected: net_profit_lamports(amount_in, amount_out, cost),
             costs,
             legs,
             quotes: vec![rt.forward.clone(), rt.back.clone()],
@@ -111,6 +137,21 @@ impl Strategy for TwoHopStrategy {
     async fn find_opportunities(&self, round_trips: &[RoundTrip]) -> Result<Vec<Route>> {
         let mut routes: Vec<Route> = round_trips
             .iter()
+            .filter(|rt| {
+                // A high-impact route is moving the pool against itself; the
+                // quoted edge is unlikely to survive execution.
+                let impact = Self::worst_price_impact(rt);
+                if impact > self.max_price_impact_pct {
+                    log::info!(
+                        "{}: skipping, price impact {:.3}% exceeds {:.3}% ceiling",
+                        rt.label,
+                        impact,
+                        self.max_price_impact_pct
+                    );
+                    return false;
+                }
+                true
+            })
             .map(|rt| self.to_route(rt))
             .filter(|r| {
                 // Both conditions matter: net_profit > 0 rejects trades that
@@ -182,8 +223,12 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_genuinely_profitable_round_trip() {
+        // Must clear the bar on the GUARANTEED minimum, not just on
+        // expectation. At +2% expected the guarantee is only +0.95% once the
+        // fixture's 0.5% threshold is applied, which is exactly the kind of
+        // trade that should not qualify against a 1% floor.
         let s = TwoHopStrategy::new(1.0, 1_000);
-        let found = s.find_opportunities(&[round_trip(1_000_000, 500, 1_020_000)]).await.unwrap();
+        let found = s.find_opportunities(&[round_trip(1_000_000, 500, 1_030_000)]).await.unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].net_profit > 0);
         assert_eq!(found[0].steps.len(), 2);
@@ -195,6 +240,50 @@ mod tests {
         let s = TwoHopStrategy::new(5.0, 1_000);
         let found = s.find_opportunities(&[round_trip(1_000_000, 500, 1_020_000)]).await.unwrap();
         assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn judges_on_worst_case_not_expected() {
+        // Expected output clears a 1% bar, but the guaranteed minimum (0.5%
+        // below, per the test fixture's threshold) does not. Judging on
+        // expectation here would take a trade that can legally settle at a
+        // loss.
+        let s = TwoHopStrategy::new(1.0, 1_000);
+        let rt = round_trip(1_000_000, 500, 1_012_000);
+
+        let expected_pct = (1_012_000i64 - 1_000_000 - 5_400) as f64 / 1_000_000.0 * 100.0;
+        assert!(expected_pct > 0.6, "fixture should look good on expectation");
+
+        let found = s.find_opportunities(&[rt]).await.unwrap();
+        assert!(
+            found.is_empty(),
+            "worst-case output must gate the decision, not the expected output"
+        );
+    }
+
+    #[tokio::test]
+    async fn worst_case_never_exceeds_expected() {
+        let s = TwoHopStrategy::new(0.0, 1_000);
+        let found = s.find_opportunities(&[round_trip(1_000_000, 500, 1_100_000)]).await.unwrap();
+        let r = &found[0];
+        assert!(
+            r.net_profit <= r.net_profit_expected,
+            "worst case {} must not exceed expected {}",
+            r.net_profit,
+            r.net_profit_expected
+        );
+        assert!(r.amount_out_worst_case <= r.amount_out);
+    }
+
+    #[tokio::test]
+    async fn rejects_routes_with_excessive_price_impact() {
+        let s = TwoHopStrategy::new(0.0, 1_000).with_max_price_impact(0.5);
+        let mut rt = round_trip(1_000_000, 500, 1_100_000);
+        // 2% impact, over the 0.5% ceiling.
+        rt.forward.price_impact_pct = 0.02;
+
+        let found = s.find_opportunities(&[rt]).await.unwrap();
+        assert!(found.is_empty(), "high price impact must disqualify a route");
     }
 
     #[tokio::test]
