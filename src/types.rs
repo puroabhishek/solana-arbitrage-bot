@@ -43,6 +43,8 @@ pub struct Route {
     pub net_profit: i64,
     /// Itemised cost of landing this trade.
     pub costs: TradeCosts,
+    /// Each leg with its quoted price, for logging.
+    pub legs: Vec<LegRecord>,
     /// The quotes backing each leg, needed to request swap transactions.
     pub quotes: Vec<Quote>,
 }
@@ -77,6 +79,26 @@ impl std::fmt::Display for DEX {
     }
 }
 
+/// One leg of a trade, with the price it was quoted at.
+///
+/// Recorded per leg so the log answers "what did it buy at, and what could it
+/// sell back at?" — the two numbers the whole strategy turns on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegRecord {
+    pub from: String,
+    pub to: String,
+    /// Base units in.
+    pub amount_in: u64,
+    /// Base units out.
+    pub amount_out: u64,
+    /// Human-scale amount in, adjusted for token decimals.
+    pub ui_amount_in: f64,
+    /// Human-scale amount out, adjusted for token decimals.
+    pub ui_amount_out: f64,
+    /// Price of this leg: `to` per one `from`, decimal-adjusted.
+    pub rate: f64,
+}
+
 /// The safety limits in force at the moment a trade was evaluated.
 ///
 /// Snapshotted per trade rather than read from config at review time, because
@@ -104,6 +126,9 @@ pub struct TradeRecord {
     /// Which strategy produced the route.
     pub strategy: String,
     pub label: String,
+    /// Each leg with its quoted price: A->B, then B->A.
+    #[serde(default)]
+    pub legs: Vec<LegRecord>,
     pub amount_in: u64,
     pub expected_out: u64,
     /// Difference before costs, in lamports.

@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::{net_profit_lamports, net_profit_percentage, Strategy, TradeCosts};
-use crate::prices::RoundTrip;
-use crate::types::{Route, SwapStep, DEX};
+use crate::prices::{to_ui_amount, RoundTrip};
+use crate::types::{LegRecord, Route, SwapStep, DEX};
 
 pub const STRATEGY_NAME: &str = "two-hop";
 
@@ -63,6 +63,29 @@ impl TwoHopStrategy {
             },
         ];
 
+        // Both legs with their quoted prices: what it buys at, and what it can
+        // sell back at.
+        let legs = vec![
+            LegRecord {
+                from: rt.base_symbol.clone(),
+                to: rt.quote_symbol.clone(),
+                amount_in: rt.forward.in_amount,
+                amount_out: rt.forward.out_amount,
+                ui_amount_in: to_ui_amount(rt.forward.in_amount, rt.base_decimals),
+                ui_amount_out: to_ui_amount(rt.forward.out_amount, rt.quote_decimals),
+                rate: rt.forward_rate(),
+            },
+            LegRecord {
+                from: rt.quote_symbol.clone(),
+                to: rt.base_symbol.clone(),
+                amount_in: rt.back.in_amount,
+                amount_out: rt.back.out_amount,
+                ui_amount_in: to_ui_amount(rt.back.in_amount, rt.quote_decimals),
+                ui_amount_out: to_ui_amount(rt.back.out_amount, rt.base_decimals),
+                rate: rt.back_rate(),
+            },
+        ];
+
         Route {
             steps,
             expected_profit: net_profit_percentage(amount_in, amount_out, cost),
@@ -73,6 +96,7 @@ impl TwoHopStrategy {
             gross_profit: amount_out as i64 - amount_in as i64,
             net_profit: net_profit_lamports(amount_in, amount_out, cost),
             costs,
+            legs,
             quotes: vec![rt.forward.clone(), rt.back.clone()],
         }
     }
@@ -128,6 +152,10 @@ mod tests {
     fn round_trip(in_amt: u64, mid: u64, out_amt: u64) -> RoundTrip {
         RoundTrip {
             label: "SOL/USDC".to_string(),
+            base_symbol: "SOL".to_string(),
+            quote_symbol: "USDC".to_string(),
+            base_decimals: 9,
+            quote_decimals: 6,
             forward: quote("SOL", "USDC", in_amt, mid),
             back: quote("USDC", "SOL", mid, out_amt),
         }

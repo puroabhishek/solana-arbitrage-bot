@@ -189,6 +189,10 @@ impl ArbitrageBot {
 
             out.push(RoundTrip {
                 label,
+                base_symbol: base.symbol.to_string(),
+                quote_symbol: quote_token.symbol.to_string(),
+                base_decimals: base.decimals,
+                quote_decimals: quote_token.decimals,
                 forward,
                 back,
             });
@@ -222,6 +226,25 @@ impl ArbitrageBot {
             return Ok(());
         }
 
+        // Report what was actually observed every cycle, profitable or not.
+        // Without this the bot looks idle while it is in fact working, and
+        // there is no way to see how far off a profitable trade the market is.
+        for rt in &round_trips {
+            let gross = rt.amount_out() as i64 - rt.amount_in() as i64;
+            log::info!(
+                "{}: {} | in {:.6} {} -> {:.6} {} -> {:.6} {} | gross {:+} lamports",
+                rt.label,
+                rt.price_summary(),
+                crate::prices::to_ui_amount(rt.amount_in(), rt.base_decimals),
+                rt.base_symbol,
+                crate::prices::to_ui_amount(rt.forward.out_amount, rt.quote_decimals),
+                rt.quote_symbol,
+                crate::prices::to_ui_amount(rt.amount_out(), rt.base_decimals),
+                rt.base_symbol,
+                gross,
+            );
+        }
+
         let mut best: Option<Route> = None;
         for strategy in &self.strategies {
             for route in strategy.find_opportunities(&round_trips).await? {
@@ -249,6 +272,12 @@ impl ArbitrageBot {
             lamports_to_sol(route.amount_in),
             lamports_to_sol(route.amount_out),
         );
+        for leg in &route.legs {
+            println!(
+                "  {} -> {}: {:.6} -> {:.6} @ {:.6} {}/{}",
+                leg.from, leg.to, leg.ui_amount_in, leg.ui_amount_out, leg.rate, leg.to, leg.from
+            );
+        }
         println!(
             "  gross {:+} lamports - costs {} (base {} + priority {}) = net {:+} lamports ({:+.3}%)",
             route.gross_profit,
@@ -311,6 +340,7 @@ impl ArbitrageBot {
             mode: self.mode.to_string(),
             strategy: route.strategy.to_string(),
             label: route.label.clone(),
+            legs: route.legs.clone(),
             amount_in: route.amount_in,
             expected_out: route.amount_out,
             gross_profit: route.gross_profit,

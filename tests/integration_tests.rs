@@ -37,6 +37,10 @@ async fn round_trip(forward_rate: f64, back_rate: f64, amount: u64) -> Result<Ro
 
     Ok(RoundTrip {
         label: format!("{}/{}", SOL.symbol, USDC.symbol),
+        base_symbol: SOL.symbol.to_string(),
+        quote_symbol: USDC.symbol.to_string(),
+        base_decimals: SOL.decimals,
+        quote_decimals: USDC.decimals,
         forward,
         back,
     })
@@ -174,6 +178,45 @@ async fn route_records_full_cost_breakdown() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn leg_prices_are_decimal_adjusted_and_recorded() -> Result<()> {
+    // 1 SOL (9dp) -> 150 USDC (6dp). In raw base units that ratio is 0.15,
+    // which is meaningless to a human; decimal-adjusted it must read as 150.
+    let rt = round_trip(0.15, 6.8, sol_to_lamports(1.0)).await?;
+
+    assert!(
+        (rt.forward_rate() - 150.0).abs() < 0.01,
+        "forward rate should be ~150 USDC/SOL, got {}",
+        rt.forward_rate()
+    );
+    // Selling back: 6.8 raw ratio -> 0.0068 SOL per USDC, i.e. ~147 USDC/SOL.
+    assert!(
+        (rt.back_rate() - 0.0068).abs() < 0.0001,
+        "back rate should be ~0.0068 SOL/USDC, got {}",
+        rt.back_rate()
+    );
+    // Inverted, the return leg is directly comparable to the outbound one.
+    assert!(
+        (rt.back_rate_inverted() - 147.06).abs() < 0.1,
+        "inverted back rate should be ~147 USDC/SOL, got {}",
+        rt.back_rate_inverted()
+    );
+
+    // And both legs must reach the trade log with those prices attached.
+    let strategy = strategies::build("two-hop", 0.0, 1_000)?;
+    let routes = strategy.find_opportunities(&[rt]).await?;
+    let legs = &routes[0].legs;
+
+    assert_eq!(legs.len(), 2, "a round trip records both legs");
+    assert_eq!(legs[0].from, "SOL");
+    assert_eq!(legs[0].to, "USDC");
+    assert!((legs[0].ui_amount_in - 1.0).abs() < 1e-9, "1 SOL in");
+    assert!((legs[0].rate - 150.0).abs() < 0.01);
+    assert_eq!(legs[1].from, "USDC");
+    assert_eq!(legs[1].to, "SOL");
+    Ok(())
+}
+
 #[test]
 fn cap_snapshot_captures_limits_in_force() {
     let limits = SafetyLimits {
@@ -209,6 +252,7 @@ fn ledger_loss_survives_reload() -> Result<()> {
         mode: "live".into(),
         strategy: "two-hop".into(),
         label: "SOL/USDC".into(),
+        legs: Vec::new(),
         amount_in: sol_to_lamports(0.01),
         expected_out: sol_to_lamports(0.011),
         gross_profit: sol_to_lamports(0.001) as i64,

@@ -321,6 +321,33 @@ attributed to it in the log. Use `TradeCosts::estimate` so costs are itemised
 consistently — the profit check must be **net**, or the strategy will report
 wins it did not earn.
 
+## Seeing what the bot is doing
+
+Logs default to `info`, so a running bot reports every scan without extra
+configuration. Each cycle logs both legs and their prices, whether or not the
+round trip was profitable:
+
+```
+INFO SOL/USDC: SOL -> USDC @ 150.230000 | USDC -> SOL @ 0.006797 (= 147.13 USDC/SOL)
+     | in 0.010000 SOL -> 1.502300 USDC -> 0.010210 SOL | gross +210000 lamports
+```
+
+Reading it: the bot bought at **150.23 USDC per SOL** and could sell back at an
+effective **147.13 USDC per SOL**. Buying high and selling back low sounds
+wrong, but it is what profit looks like here — the cheaper SOL is on the return
+leg, the more of it your USDC buys back.
+
+Verbosity:
+
+```bash
+RUST_LOG=warn cargo run -- start     # quieter: problems only
+RUST_LOG=debug cargo run -- start    # louder
+cargo run -- start > bot.log 2>&1    # to a file
+```
+
+Prices also land in the trade log whenever an opportunity is found, and
+`cargo run -- history` shows them per leg under **Path (buy @ / sell @)**.
+
 ## Understanding the numbers
 
 Amounts are in **lamports**, the smallest unit of SOL:

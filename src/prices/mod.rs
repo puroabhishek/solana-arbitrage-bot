@@ -68,10 +68,23 @@ pub struct Quote {
 pub struct RoundTrip {
     /// Display label, e.g. "SOL/USDC".
     pub label: String,
+    /// Symbol of the token the trip starts and ends in, e.g. "SOL".
+    pub base_symbol: String,
+    /// Symbol of the intermediate token, e.g. "USDC".
+    pub quote_symbol: String,
+    /// Decimals of the base token, needed to render human-readable prices.
+    pub base_decimals: u8,
+    /// Decimals of the intermediate token.
+    pub quote_decimals: u8,
     /// First leg, e.g. SOL -> USDC.
     pub forward: Quote,
     /// Return leg, e.g. USDC -> SOL.
     pub back: Quote,
+}
+
+/// Convert a base-unit amount to its human-scale value.
+pub fn to_ui_amount(raw: u64, decimals: u8) -> f64 {
+    raw as f64 / 10f64.powi(decimals as i32)
 }
 
 impl RoundTrip {
@@ -83,6 +96,56 @@ impl RoundTrip {
     /// Base units of the starting token received back.
     pub fn amount_out(&self) -> u64 {
         self.back.out_amount
+    }
+
+    /// Price of the outbound leg: quote tokens per one base token.
+    ///
+    /// Decimal-adjusted, so this is the price a human would recognise (e.g.
+    /// ~150 USDC per SOL) rather than a raw base-unit ratio.
+    pub fn forward_rate(&self) -> f64 {
+        let input = to_ui_amount(self.forward.in_amount, self.base_decimals);
+        if input == 0.0 {
+            return 0.0;
+        }
+        to_ui_amount(self.forward.out_amount, self.quote_decimals) / input
+    }
+
+    /// Price of the return leg: base tokens per one quote token.
+    pub fn back_rate(&self) -> f64 {
+        let input = to_ui_amount(self.back.in_amount, self.quote_decimals);
+        if input == 0.0 {
+            return 0.0;
+        }
+        to_ui_amount(self.back.out_amount, self.base_decimals) / input
+    }
+
+    /// The return leg expressed the same way round as the outbound leg, so the
+    /// two are directly comparable: quote tokens per one base token.
+    ///
+    /// Arbitrage exists when you can sell back at a better price than you
+    /// bought at, so seeing both in the same units is what makes a gap visible.
+    pub fn back_rate_inverted(&self) -> f64 {
+        let r = self.back_rate();
+        if r == 0.0 {
+            return 0.0;
+        }
+        1.0 / r
+    }
+
+    /// One-line summary of both legs, for logs.
+    pub fn price_summary(&self) -> String {
+        format!(
+            "{} -> {} @ {:.6} | {} -> {} @ {:.6} (= {:.6} {}/{})",
+            self.base_symbol,
+            self.quote_symbol,
+            self.forward_rate(),
+            self.quote_symbol,
+            self.base_symbol,
+            self.back_rate(),
+            self.back_rate_inverted(),
+            self.quote_symbol,
+            self.base_symbol,
+        )
     }
 }
 

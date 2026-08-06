@@ -286,6 +286,7 @@ impl BotInterface {
             "Mode",
             "Strategy",
             "Pair",
+            "Path (buy @ / sell @)",
             "In (SOL)",
             "Gross",
             "Fees",
@@ -300,6 +301,16 @@ impl BotInterface {
                 r.mode,
                 r.strategy,
                 r.label,
+                // The two prices the strategy turns on: bought at, sold at.
+                if r.legs.is_empty() {
+                    "-".to_string()
+                } else {
+                    r.legs
+                        .iter()
+                        .map(|l| format!("{}->{} @{:.4}", l.from, l.to, l.rate))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                },
                 format!("{:.6}", lamports_to_sol(r.amount_in)),
                 format!("{:+}", r.gross_profit),
                 // Base + priority, itemised so a rejection is auditable.

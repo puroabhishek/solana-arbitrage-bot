@@ -27,6 +27,10 @@ async fn round_trip(sol_to_usdc: f64, usdc_to_sol: f64, amount: u64) -> Result<R
 
     Ok(RoundTrip {
         label: format!("{}/{}", SOL.symbol, USDC.symbol),
+        base_symbol: SOL.symbol.to_string(),
+        quote_symbol: USDC.symbol.to_string(),
+        base_decimals: SOL.decimals,
+        quote_decimals: USDC.decimals,
         forward,
         back,
     })
@@ -34,6 +38,7 @@ async fn round_trip(sol_to_usdc: f64, usdc_to_sol: f64, amount: u64) -> Result<R
 
 async fn evaluate(name: &str, rt: RoundTrip, strategy: &TwoHopStrategy) -> Result<()> {
     println!("\n--- {} ---", name);
+    println!("  {}", rt.price_summary());
     println!(
         "  in  {:.6} SOL -> {} USDC -> out {:.6} SOL",
         lamports_to_sol(rt.amount_in()),

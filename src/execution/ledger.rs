@@ -79,6 +79,7 @@ mod tests {
             mode: "live".to_string(),
             strategy: "two-hop".to_string(),
             label: "SOL/USDC".to_string(),
+            legs: Vec::new(),
             amount_in: 1_000_000,
             expected_out: 1_010_000,
             gross_profit: 10_000,
