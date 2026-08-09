@@ -37,6 +37,10 @@ async fn round_trip(forward_rate: f64, back_rate: f64, amount: u64) -> Result<Ro
 
     Ok(RoundTrip {
         label: format!("{}/{}", SOL.symbol, USDC.symbol),
+        base_symbol: SOL.symbol.to_string(),
+        quote_symbol: USDC.symbol.to_string(),
+        base_decimals: SOL.decimals,
+        quote_decimals: USDC.decimals,
         forward,
         back,
     })
@@ -166,11 +170,63 @@ async fn route_records_full_cost_breakdown() -> Result<()> {
     assert_eq!(route.costs.total_lamports(), 5_400);
     assert_eq!(route.costs.compute_units, 400_000);
 
-    // And the arithmetic linking gross, costs and net must hold exactly.
+    // The expected-case arithmetic must hold exactly.
     assert_eq!(
-        route.net_profit,
+        route.net_profit_expected,
         route.gross_profit - route.costs.total_lamports() as i64
     );
+
+    // And the decision figure is the worst case, which is derived from the
+    // guaranteed-minimum output rather than the expected one.
+    assert_eq!(
+        route.net_profit,
+        route.amount_out_worst_case as i64
+            - route.amount_in as i64
+            - route.costs.total_lamports() as i64
+    );
+    assert!(
+        route.net_profit <= route.net_profit_expected,
+        "the decision must never be more optimistic than expectation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn leg_prices_are_decimal_adjusted_and_recorded() -> Result<()> {
+    // 1 SOL (9dp) -> 150 USDC (6dp). In raw base units that ratio is 0.15,
+    // which is meaningless to a human; decimal-adjusted it must read as 150.
+    let rt = round_trip(0.15, 6.8, sol_to_lamports(1.0)).await?;
+
+    assert!(
+        (rt.forward_rate() - 150.0).abs() < 0.01,
+        "forward rate should be ~150 USDC/SOL, got {}",
+        rt.forward_rate()
+    );
+    // Selling back: 6.8 raw ratio -> 0.0068 SOL per USDC, i.e. ~147 USDC/SOL.
+    assert!(
+        (rt.back_rate() - 0.0068).abs() < 0.0001,
+        "back rate should be ~0.0068 SOL/USDC, got {}",
+        rt.back_rate()
+    );
+    // Inverted, the return leg is directly comparable to the outbound one.
+    assert!(
+        (rt.back_rate_inverted() - 147.06).abs() < 0.1,
+        "inverted back rate should be ~147 USDC/SOL, got {}",
+        rt.back_rate_inverted()
+    );
+
+    // And both legs must reach the trade log with those prices attached.
+    let strategy = strategies::build("two-hop", 0.0, 1_000)?;
+    let routes = strategy.find_opportunities(&[rt]).await?;
+    let legs = &routes[0].legs;
+
+    assert_eq!(legs.len(), 2, "a round trip records both legs");
+    assert_eq!(legs[0].from, "SOL");
+    assert_eq!(legs[0].to, "USDC");
+    assert!((legs[0].ui_amount_in - 1.0).abs() < 1e-9, "1 SOL in");
+    assert!((legs[0].rate - 150.0).abs() < 0.01);
+    assert_eq!(legs[1].from, "USDC");
+    assert_eq!(legs[1].to, "SOL");
     Ok(())
 }
 
@@ -209,10 +265,13 @@ fn ledger_loss_survives_reload() -> Result<()> {
         mode: "live".into(),
         strategy: "two-hop".into(),
         label: "SOL/USDC".into(),
+        legs: Vec::new(),
         amount_in: sol_to_lamports(0.01),
         expected_out: sol_to_lamports(0.011),
+        worst_case_out: sol_to_lamports(0.0105),
         gross_profit: sol_to_lamports(0.001) as i64,
-        net_profit: sol_to_lamports(0.0009) as i64,
+        net_profit: sol_to_lamports(0.0004) as i64,
+        net_profit_expected: sol_to_lamports(0.0009) as i64,
         expected_profit_pct: 1.0,
         costs: TradeCosts::estimate(1, 1_000, 400_000),
         caps: CapSnapshot {

@@ -18,14 +18,33 @@ use solana_sdk::{
 pub struct TransactionBuilder {
     wallet: Keypair,
     priority_fee_microlamports: u64,
+    /// Compute budget requested for a composed multi-leg transaction.
+    ///
+    /// The priority fee is charged on the *requested* limit, not the amount
+    /// consumed, so over-requesting is a direct cash cost.
+    compute_unit_limit: u32,
 }
+
+/// Compute budget for a two-leg atomic swap. Enough headroom for both legs
+/// plus setup, without over-requesting and paying for unused units.
+pub const DEFAULT_COMPOSED_COMPUTE_UNITS: u32 = 600_000;
 
 impl TransactionBuilder {
     pub fn new(wallet: Keypair, priority_fee_microlamports: u64) -> Self {
         Self {
             wallet,
             priority_fee_microlamports,
+            compute_unit_limit: DEFAULT_COMPOSED_COMPUTE_UNITS,
         }
+    }
+
+    pub fn with_compute_unit_limit(mut self, limit: u32) -> Self {
+        self.compute_unit_limit = limit;
+        self
+    }
+
+    pub fn compute_unit_limit(&self) -> u32 {
+        self.compute_unit_limit
     }
 
     pub fn pubkey(&self) -> Pubkey {
@@ -50,6 +69,31 @@ impl TransactionBuilder {
         let signed = VersionedTransaction::try_new(tx.message, &[&self.wallet])
             .map_err(|e| anyhow!("signing swap transaction: {}", e))?;
         Ok(signed)
+    }
+
+    /// Compose every leg of a route into one atomic transaction.
+    ///
+    /// This is what makes the round trip real: both swaps land together or
+    /// neither does. Returns `Err` when they will not fit, so the caller can
+    /// refuse rather than execute a partial trade.
+    /// `tip` attaches a Jito tip transfer inside the same transaction, so it is
+    /// paid only if the round trip succeeds.
+    pub fn compose_legs(
+        &self,
+        legs: &[crate::prices::SwapInstructions],
+        lookup_tables: &[solana_sdk::address_lookup_table_account::AddressLookupTableAccount],
+        recent_blockhash: solana_sdk::hash::Hash,
+        tip: Option<(Pubkey, u64)>,
+    ) -> Result<VersionedTransaction> {
+        super::compose::compose_atomic_transaction(
+            legs,
+            &self.wallet,
+            lookup_tables,
+            recent_blockhash,
+            self.compute_unit_limit,
+            self.priority_fee_microlamports,
+            tip,
+        )
     }
 
     /// A real but trivial transaction used by `rehearse` mode.

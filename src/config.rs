@@ -143,6 +143,15 @@ pub struct Config {
     pub wallet_path: Option<String>,
     /// Discord incoming-webhook URL. Unset disables notifications entirely.
     pub discord_webhook_url: Option<String>,
+    /// Submit via Jito bundles rather than a naked transaction.
+    ///
+    /// Defaults on: a bundle is atomic across both legs, and an unselected
+    /// bundle commits nothing and therefore costs nothing, where a reverted
+    /// naked transaction still burns the fee.
+    pub use_jito_bundles: bool,
+    pub jito_block_engine_url: String,
+    /// Which landed-tip percentile to pay.
+    pub jito_tip_percentile: String,
 }
 
 impl Config {
@@ -151,6 +160,40 @@ impl Config {
         self.rpc_url_override
             .clone()
             .unwrap_or_else(|| network.default_rpc_url().to_string())
+    }
+
+    /// The profit floor slippage alone imposes, as a percentage.
+    ///
+    /// Each leg may execute up to `slippage_bps` worse than quoted, and a round
+    /// trip has two legs, so the round trip can lose twice that before
+    /// anything has gone wrong.
+    pub fn slippage_floor_pct(&self) -> f64 {
+        2.0 * (self.slippage_bps as f64 / 100.0)
+    }
+
+    /// Reject configurations that can act on trades guaranteed to be able to
+    /// lose money.
+    ///
+    /// If the profit threshold sits below what slippage can take, a trade can
+    /// pass the filter, execute entirely within tolerance, and still settle at
+    /// a loss. That is a configuration error, not a trading risk, so it fails
+    /// at startup rather than silently at trade time.
+    pub fn validate(&self) -> Result<()> {
+        let floor = self.slippage_floor_pct();
+        if self.min_profit_percentage <= floor {
+            return Err(anyhow!(
+                "MIN_PROFIT_PERCENTAGE ({:.3}%) must exceed {:.3}% — with SLIPPAGE_BPS={} \
+                 each leg may fill {:.3}% worse than quoted, and a round trip has two legs, \
+                 so a trade could pass this filter and still settle at a loss. \
+                 Either raise MIN_PROFIT_PERCENTAGE above {:.3}% or lower SLIPPAGE_BPS.",
+                self.min_profit_percentage,
+                floor,
+                self.slippage_bps,
+                self.slippage_bps as f64 / 100.0,
+                floor,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -201,6 +244,13 @@ lazy_static! {
             poll_interval_secs: env_parse("POLL_INTERVAL_SECS", 10),
             wallet_path: env_opt("WALLET_PATH"),
             discord_webhook_url: env_opt("DISCORD_WEBHOOK_URL"),
+            use_jito_bundles: env_opt("USE_JITO_BUNDLES")
+                .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
+            jito_block_engine_url: env_opt("JITO_BLOCK_ENGINE_URL")
+                .unwrap_or_else(|| crate::execution::bundle::DEFAULT_BLOCK_ENGINE.to_string()),
+            jito_tip_percentile: env_opt("JITO_TIP_PERCENTILE")
+                .unwrap_or_else(|| "50".to_string()),
         }
     };
 }
@@ -235,6 +285,52 @@ mod tests {
         // Rehearse is devnet by definition.
         assert_eq!(ExecutionMode::Rehearse.implied_network(), Network::Devnet);
         assert_eq!(ExecutionMode::Live.implied_network(), Network::Mainnet);
+    }
+
+    fn cfg(min_profit: f64, slippage_bps: u16) -> Config {
+        Config {
+            rpc_url_override: None,
+            network: Network::Mainnet,
+            min_profit_percentage: min_profit,
+            max_spend_lamports: None,
+            max_cumulative_loss_lamports: None,
+            slippage_bps,
+            priority_fee_microlamports: 1_000,
+            jupiter_base_url: JUPITER_LITE_URL.to_string(),
+            jupiter_api_key: None,
+            poll_interval_secs: 10,
+            wallet_path: None,
+            discord_webhook_url: None,
+            use_jito_bundles: true,
+            jito_block_engine_url: crate::execution::bundle::DEFAULT_BLOCK_ENGINE.to_string(),
+            jito_tip_percentile: "50".to_string(),
+        }
+    }
+
+    #[test]
+    fn slippage_floor_counts_both_legs() {
+        // 50 bps per leg, two legs, so 1% of round-trip value can vanish.
+        assert!((cfg(1.5, 50).slippage_floor_pct() - 1.0).abs() < 1e-9);
+        assert!((cfg(1.5, 10).slippage_floor_pct() - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_profit_threshold_below_slippage_floor() {
+        // 0.3% profit target with 1% of slippage headroom: a trade could pass
+        // the filter and still settle at a loss.
+        let err = cfg(0.3, 50).validate().unwrap_err().to_string();
+        assert!(err.contains("MIN_PROFIT_PERCENTAGE"), "got: {}", err);
+        assert!(err.contains("SLIPPAGE_BPS"), "should name the other knob too");
+
+        // Exactly at the floor is still rejected — it leaves zero margin.
+        assert!(cfg(1.0, 50).validate().is_err());
+    }
+
+    #[test]
+    fn accepts_threshold_above_slippage_floor() {
+        assert!(cfg(1.5, 50).validate().is_ok());
+        // Tightening slippage lowers the floor, so a smaller target is fine.
+        assert!(cfg(0.5, 10).validate().is_ok());
     }
 
     #[test]

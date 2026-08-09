@@ -16,7 +16,13 @@ fn initialize_directories() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
-    env_logger::init();
+
+    // Default to `info` so the bot is observable out of the box. env_logger's
+    // own default is error-only, which silently hides every info/warn line and
+    // makes a running bot look like it is doing nothing. RUST_LOG still wins.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
 
     // Initialize directories
     initialize_directories()

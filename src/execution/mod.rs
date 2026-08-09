@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::transaction::VersionedTransaction;
 
+pub mod bundle;
+pub mod compose;
 pub mod ledger;
 pub mod mev_builder;
 pub mod transaction_builder;
@@ -28,6 +30,9 @@ pub enum Refusal {
     LossCapReached { lost: u64, cap: u64 },
     /// Simulation against the cluster failed.
     SimulationFailed(String),
+    /// The legs could not be combined into one atomic transaction, so the
+    /// round trip cannot be guaranteed.
+    NotAtomic(String),
 }
 
 impl std::fmt::Display for Refusal {
@@ -58,6 +63,11 @@ impl std::fmt::Display for Refusal {
                 lamports_to_sol(*cap)
             ),
             Refusal::SimulationFailed(e) => write!(f, "simulation failed: {}", e),
+            Refusal::NotAtomic(e) => write!(
+                f,
+                "cannot execute atomically, so refusing rather than risk a partial fill: {}",
+                e
+            ),
         }
     }
 }
@@ -70,6 +80,12 @@ pub enum ExecutionOutcome {
     Simulated,
     /// Actually submitted and confirmed.
     Submitted { signature: String },
+    /// Submitted but did not land.
+    ///
+    /// Distinguishes the two cases that differ entirely in cost: a bundle that
+    /// lost its auction commits nothing and costs nothing, while a naked
+    /// transaction that reverted still burnt the fee.
+    SubmissionFailed { error: String, cost_lamports: u64 },
     /// Deliberately not submitted, with a named reason.
     Refused(Refusal),
 }
@@ -93,6 +109,9 @@ impl SafetyLimits {
 pub struct ExecutionEngine {
     transaction_builder: TransactionBuilder,
     limits: SafetyLimits,
+    /// Set to submit atomic bundles instead of naked transactions.
+    bundles: Option<bundle::BundleClient>,
+    tip_percentile: bundle::TipPercentile,
 }
 
 impl ExecutionEngine {
@@ -100,7 +119,23 @@ impl ExecutionEngine {
         Self {
             transaction_builder,
             limits,
+            bundles: None,
+            tip_percentile: bundle::TipPercentile::P50,
         }
+    }
+
+    pub fn with_bundles(
+        mut self,
+        client: bundle::BundleClient,
+        tip_percentile: bundle::TipPercentile,
+    ) -> Self {
+        self.bundles = Some(client);
+        self.tip_percentile = tip_percentile;
+        self
+    }
+
+    pub fn uses_bundles(&self) -> bool {
+        self.bundles.is_some()
     }
 
     pub fn builder(&self) -> &TransactionBuilder {
@@ -191,16 +226,66 @@ impl ExecutionEngine {
             });
         }
 
-        // Simulate and live both need the real swap transaction.
-        let first = route
-            .quotes
-            .first()
-            .ok_or_else(|| anyhow!("route has no quotes; cannot build a swap"))?;
-        let encoded = source
-            .swap_transaction(first, &self.transaction_builder.pubkey().to_string())
-            .await
-            .context("fetching swap transaction from price source")?;
-        let tx = self.transaction_builder.sign_encoded_swap(&encoded)?;
+        // Simulate and live both need the real swap transaction, containing
+        // EVERY leg. Executing only the first leg would buy the intermediate
+        // token and never sell it, while reporting a round-trip profit that
+        // did not happen.
+        if route.quotes.is_empty() {
+            return Err(anyhow!("route has no quotes; cannot build a swap"));
+        }
+
+        let user = self.transaction_builder.pubkey().to_string();
+        let mut legs = Vec::with_capacity(route.quotes.len());
+        for (i, quote) in route.quotes.iter().enumerate() {
+            legs.push(
+                source
+                    .swap_instructions(quote, &user)
+                    .await
+                    .with_context(|| format!("fetching swap instructions for leg {}", i + 1))?,
+            );
+        }
+
+        let table_addresses = compose::merge_lookup_table_addresses(&legs);
+        let lookup_tables = compose::load_lookup_tables(rpc, &table_addresses)
+            .context("loading address lookup tables")?;
+
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .context("fetching recent blockhash")?;
+
+        // Only tip when actually submitting a bundle: a tip in a simulation
+        // would distort the compute and balance figures for no benefit.
+        let tip = match (&self.bundles, mode) {
+            (Some(client), ExecutionMode::Live) => {
+                let lamports = match client.tip_floor().await {
+                    Ok(floor) => floor.lamports_for(self.tip_percentile),
+                    // A missing tip feed must not block trading; fall back to
+                    // the documented minimum and say so.
+                    Err(e) => {
+                        log::warn!(
+                            "tip floor unavailable ({}), falling back to minimum {} lamports",
+                            e,
+                            bundle::MIN_TIP_LAMPORTS
+                        );
+                        bundle::MIN_TIP_LAMPORTS
+                    }
+                };
+                Some((bundle::BundleClient::random_tip_account()?, lamports))
+            }
+            _ => None,
+        };
+
+        let tx = match self
+            .transaction_builder
+            .compose_legs(&legs, &lookup_tables, blockhash, tip)
+        {
+            Ok(tx) => tx,
+            // A round trip that cannot be made atomic must not be attempted at
+            // all — a partial fill is worse than no trade.
+            Err(e) => {
+                return Ok(ExecutionOutcome::Refused(Refusal::NotAtomic(e.to_string())))
+            }
+        };
 
         // Always simulate first, including on the live path.
         if let Err(e) = simulate(rpc, &tx) {
@@ -213,11 +298,31 @@ impl ExecutionEngine {
             return Ok(ExecutionOutcome::Simulated);
         }
 
-        let sig = rpc
-            .send_and_confirm_transaction(&tx)
-            .context("submitting swap transaction")?;
-        Ok(ExecutionOutcome::Submitted {
-            signature: sig.to_string(),
+        // A submission failure must be reported, not propagated: letting `?`
+        // escape here skips recording entirely, so burnt fees never reach the
+        // loss cap and the most common real loss stays invisible.
+        if let Some(client) = &self.bundles {
+            return Ok(match client.send_bundle(std::slice::from_ref(&tx)).await {
+                Ok(bundle_id) => ExecutionOutcome::Submitted {
+                    signature: bundle_id,
+                },
+                // An unselected or rejected bundle commits nothing on-chain.
+                Err(e) => ExecutionOutcome::SubmissionFailed {
+                    error: e.to_string(),
+                    cost_lamports: 0,
+                },
+            });
+        }
+
+        Ok(match rpc.send_and_confirm_transaction(&tx) {
+            Ok(sig) => ExecutionOutcome::Submitted {
+                signature: sig.to_string(),
+            },
+            // A naked transaction that reverted still paid its fee.
+            Err(e) => ExecutionOutcome::SubmissionFailed {
+                error: e.to_string(),
+                cost_lamports: route.costs.total_lamports(),
+            },
         })
     }
 }

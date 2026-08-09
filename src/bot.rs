@@ -84,6 +84,9 @@ impl ArbitrageBot {
         trade_size_lamports: u64,
         strategy_name: &str,
     ) -> Result<Self> {
+        // Fail fast on a configuration that could act on losing trades.
+        CONFIG.validate()?;
+
         let wallet_path = CONFIG
             .wallet_path
             .clone()
@@ -100,13 +103,25 @@ impl ArbitrageBot {
             CONFIG.priority_fee_microlamports,
         )?);
 
-        let execution_engine = ExecutionEngine::new(
+        let mut execution_engine = ExecutionEngine::new(
             TransactionBuilder::new(wallet, CONFIG.priority_fee_microlamports),
             SafetyLimits {
                 max_spend_lamports: CONFIG.max_spend_lamports,
                 max_cumulative_loss_lamports: CONFIG.max_cumulative_loss_lamports,
             },
         );
+
+        // Bundles are the default: they make the round trip atomic, and an
+        // unselected bundle costs nothing where a reverted naked transaction
+        // still burns the fee.
+        if CONFIG.use_jito_bundles {
+            let percentile = CONFIG
+                .jito_tip_percentile
+                .parse::<crate::execution::bundle::TipPercentile>()?;
+            let client =
+                crate::execution::bundle::BundleClient::new(CONFIG.jito_block_engine_url.clone())?;
+            execution_engine = execution_engine.with_bundles(client, percentile);
+        }
 
         let strategy = strategies::build(
             strategy_name,
@@ -189,6 +204,10 @@ impl ArbitrageBot {
 
             out.push(RoundTrip {
                 label,
+                base_symbol: base.symbol.to_string(),
+                quote_symbol: quote_token.symbol.to_string(),
+                base_decimals: base.decimals,
+                quote_decimals: quote_token.decimals,
                 forward,
                 back,
             });
@@ -222,6 +241,25 @@ impl ArbitrageBot {
             return Ok(());
         }
 
+        // Report what was actually observed every cycle, profitable or not.
+        // Without this the bot looks idle while it is in fact working, and
+        // there is no way to see how far off a profitable trade the market is.
+        for rt in &round_trips {
+            let gross = rt.amount_out() as i64 - rt.amount_in() as i64;
+            log::info!(
+                "{}: {} | in {:.6} {} -> {:.6} {} -> {:.6} {} | gross {:+} lamports",
+                rt.label,
+                rt.price_summary(),
+                crate::prices::to_ui_amount(rt.amount_in(), rt.base_decimals),
+                rt.base_symbol,
+                crate::prices::to_ui_amount(rt.forward.out_amount, rt.quote_decimals),
+                rt.quote_symbol,
+                crate::prices::to_ui_amount(rt.amount_out(), rt.base_decimals),
+                rt.base_symbol,
+                gross,
+            );
+        }
+
         let mut best: Option<Route> = None;
         for strategy in &self.strategies {
             for route in strategy.find_opportunities(&round_trips).await? {
@@ -249,15 +287,33 @@ impl ArbitrageBot {
             lamports_to_sol(route.amount_in),
             lamports_to_sol(route.amount_out),
         );
+        for leg in &route.legs {
+            println!(
+                "  {} -> {}: {:.6} -> {:.6} @ {:.6} {}/{}",
+                leg.from, leg.to, leg.ui_amount_in, leg.ui_amount_out, leg.rate, leg.to, leg.from
+            );
+        }
         println!(
-            "  gross {:+} lamports - costs {} (base {} + priority {}) = net {:+} lamports ({:+.3}%)",
+            "  gross {:+} lamports - costs {} (base {} + priority {})",
             route.gross_profit,
             route.costs.total_lamports(),
             route.costs.base_fee_lamports,
             route.costs.priority_fee_lamports,
-            route.net_profit,
-            route.expected_profit
         );
+        // Both figures, because the gap between them is exactly how much
+        // slippage tolerance is being relied on. The decision uses the worst.
+        println!(
+            "  net: {:+} lamports worst-case ({:+.3}%)  |  {:+} expected",
+            route.net_profit, route.expected_profit, route.net_profit_expected
+        );
+
+        // Balance before, so realised profit can be measured rather than
+        // assumed. Only meaningful when we are actually going to submit.
+        let balance_before = if self.mode.submits() {
+            self.connection.get_balance(&self.wallet_pubkey).ok()
+        } else {
+            None
+        };
 
         let outcome = self
             .execution_engine
@@ -270,11 +326,27 @@ impl ArbitrageBot {
             )
             .await?;
 
-        self.record(&route, &outcome).await?;
+        self.record(&route, &outcome, balance_before).await?;
         Ok(())
     }
 
-    async fn record(&mut self, route: &Route, outcome: &ExecutionOutcome) -> Result<()> {
+    /// Measure what a submitted trade actually did to the wallet.
+    ///
+    /// Storing the pre-trade estimate as "realised" profit makes the
+    /// cumulative-loss cap unable to see slippage, failed legs or fees — the
+    /// prediction can never disagree with itself. Only the balance delta can.
+    fn measure_realised(&self, before: Option<u64>) -> Option<i64> {
+        let before = before?;
+        let after = self.connection.get_balance(&self.wallet_pubkey).ok()?;
+        Some(after as i64 - before as i64)
+    }
+
+    async fn record(
+        &mut self,
+        route: &Route,
+        outcome: &ExecutionOutcome,
+        balance_before: Option<u64>,
+    ) -> Result<()> {
         let (outcome_label, signature) = match outcome {
             ExecutionOutcome::Detected => ("detected".to_string(), None),
             ExecutionOutcome::Simulated => {
@@ -285,16 +357,39 @@ impl ArbitrageBot {
                 println!("  submitted: {}", signature);
                 ("submitted".to_string(), Some(signature.clone()))
             }
+            ExecutionOutcome::SubmissionFailed {
+                error,
+                cost_lamports,
+            } => {
+                if *cost_lamports == 0 {
+                    println!("  did not land (no cost): {}", error);
+                } else {
+                    println!("  did not land, cost {} lamports: {}", cost_lamports, error);
+                }
+                (format!("submission failed: {}", error), None)
+            }
             ExecutionOutcome::Refused(r) => {
                 println!("  refused: {}", r);
                 (format!("refused: {}", r), None)
             }
         };
 
-        // Only a confirmed submission has a realised result; everything else
-        // must stay None so it cannot skew the loss cap.
+        // Realised profit must come from the chain, not from the estimate that
+        // authorised the trade — otherwise the loss cap can never disagree
+        // with the prediction and will never trip.
         let realised = match outcome {
-            ExecutionOutcome::Submitted { .. } => Some(route.net_profit),
+            ExecutionOutcome::Submitted { .. } => {
+                let measured = self.measure_realised(balance_before);
+                if measured.is_none() {
+                    log::warn!("could not measure realised profit; balance read failed");
+                }
+                measured
+            }
+            // A failed attempt's cost is a real loss, even though no trade
+            // happened. Zero-cost misses are recorded as zero, not ignored.
+            ExecutionOutcome::SubmissionFailed { cost_lamports, .. } => {
+                Some(-(*cost_lamports as i64))
+            }
             _ => None,
         };
 
@@ -311,10 +406,13 @@ impl ArbitrageBot {
             mode: self.mode.to_string(),
             strategy: route.strategy.to_string(),
             label: route.label.clone(),
+            legs: route.legs.clone(),
             amount_in: route.amount_in,
             expected_out: route.amount_out,
+            worst_case_out: route.amount_out_worst_case,
             gross_profit: route.gross_profit,
             net_profit: route.net_profit,
+            net_profit_expected: route.net_profit_expected,
             expected_profit_pct: route.expected_profit,
             costs: route.costs,
             caps,
@@ -346,6 +444,15 @@ impl ArbitrageBot {
             ExecutionOutcome::Detected => (Level::Info, "Opportunity detected"),
             ExecutionOutcome::Simulated => (Level::Notable, "Simulated OK"),
             ExecutionOutcome::Submitted { .. } => (Level::Notable, "Trade submitted"),
+            // A free miss is routine on the bundle path; one that cost money
+            // is worth attention.
+            ExecutionOutcome::SubmissionFailed { cost_lamports, .. } => {
+                if *cost_lamports == 0 {
+                    (Level::Info, "Did not land (no cost)")
+                } else {
+                    (Level::Alert, "Submission failed, fee paid")
+                }
+            }
             ExecutionOutcome::Refused(Refusal::LossCapReached { .. }) => {
                 (Level::Alert, "HALTED: loss cap reached")
             }

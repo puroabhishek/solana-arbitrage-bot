@@ -27,7 +27,8 @@ pub struct ArbitrageOpportunity {
 #[derive(Debug, Clone)]
 pub struct Route {
     pub steps: Vec<SwapStep>,
-    /// Net profit as a percentage of the amount committed, after fees.
+    /// Net profit as a percentage of the amount committed, after fees,
+    /// computed on the worst-case output. This is the decision figure.
     pub expected_profit: f64,
     /// Display label, e.g. "SOL/USDC".
     pub label: String,
@@ -35,14 +36,23 @@ pub struct Route {
     pub strategy: &'static str,
     /// Base units of the starting token committed.
     pub amount_in: u64,
-    /// Base units of the starting token expected back.
+    /// Base units of the starting token expected back, at the mid quote.
     pub amount_out: u64,
-    /// Gross difference before costs. Negative is a loss.
+    /// Base units guaranteed back in the worst case slippage allows.
+    pub amount_out_worst_case: u64,
+    /// Gross difference before costs, at the expected amount.
     pub gross_profit: i64,
-    /// Net profit in base units after transaction costs. Negative is a loss.
+    /// Net profit after costs, computed on the **worst case**. This is what
+    /// the trade decision is made on.
     pub net_profit: i64,
+    /// Net profit after costs at the expected amount, for comparison. Always
+    /// greater than or equal to `net_profit`; a wide gap means slippage
+    /// tolerance is doing a lot of work.
+    pub net_profit_expected: i64,
     /// Itemised cost of landing this trade.
     pub costs: TradeCosts,
+    /// Each leg with its quoted price, for logging.
+    pub legs: Vec<LegRecord>,
     /// The quotes backing each leg, needed to request swap transactions.
     pub quotes: Vec<Quote>,
 }
@@ -77,6 +87,26 @@ impl std::fmt::Display for DEX {
     }
 }
 
+/// One leg of a trade, with the price it was quoted at.
+///
+/// Recorded per leg so the log answers "what did it buy at, and what could it
+/// sell back at?" — the two numbers the whole strategy turns on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegRecord {
+    pub from: String,
+    pub to: String,
+    /// Base units in.
+    pub amount_in: u64,
+    /// Base units out.
+    pub amount_out: u64,
+    /// Human-scale amount in, adjusted for token decimals.
+    pub ui_amount_in: f64,
+    /// Human-scale amount out, adjusted for token decimals.
+    pub ui_amount_out: f64,
+    /// Price of this leg: `to` per one `from`, decimal-adjusted.
+    pub rate: f64,
+}
+
 /// The safety limits in force at the moment a trade was evaluated.
 ///
 /// Snapshotted per trade rather than read from config at review time, because
@@ -104,12 +134,21 @@ pub struct TradeRecord {
     /// Which strategy produced the route.
     pub strategy: String,
     pub label: String,
+    /// Each leg with its quoted price: A->B, then B->A.
+    #[serde(default)]
+    pub legs: Vec<LegRecord>,
     pub amount_in: u64,
     pub expected_out: u64,
-    /// Difference before costs, in lamports.
+    /// Guaranteed-minimum output the decision was based on.
+    #[serde(default)]
+    pub worst_case_out: u64,
+    /// Difference before costs, in lamports, at the expected amount.
     pub gross_profit: i64,
-    /// Difference after costs, in lamports. This drives the decision.
+    /// Difference after costs on the **worst case**. This drove the decision.
     pub net_profit: i64,
+    /// Net profit at the expected amount, for comparison.
+    #[serde(default)]
+    pub net_profit_expected: i64,
     pub expected_profit_pct: f64,
     /// Itemised cost of landing the trade.
     pub costs: TradeCosts,
