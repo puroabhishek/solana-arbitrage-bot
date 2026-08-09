@@ -52,11 +52,23 @@ clear that file deliberately.
 
 ## Requirements
 
-- Rust (stable) and Cargo
-- A Solana RPC endpoint. The public devnet endpoint is fine for testing; real
+- **Rust (stable) and Cargo**
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source "$HOME/.cargo/env"
+  ```
+- **Solana CLI** — optional. Only needed to generate a keypair and airdrop
+  devnet SOL; both have alternatives (see below).
+  ```bash
+  sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+  ```
+  The CLI is maintained by Anza; the older `release.solana.com` URL is
+  superseded. Both installers print a PATH line — run it, or open a new
+  terminal, or `cargo`/`solana` will still be "command not found".
+- **A Solana RPC endpoint.** Public endpoints are fine for testing; real
   arbitrage scanning needs a low-latency provider (Helius, QuickNode, Triton),
   which generally means signing up for an API key.
-- A Solana wallet keypair (see below)
+- **A Solana wallet keypair** (see below)
 
 ## Wallet setup
 
@@ -85,10 +97,12 @@ Import it into Solflare or Phantom afterwards if you want a UI to manage it.
 
 ### Option B — export from Solflare or Phantom
 
-In the wallet: **Settings → Export Private Key**, then save the base58 string
-to a plain text file and restrict it:
+Needs no Solana CLI. In the wallet, create a **new, empty** wallet, then
+**Settings → Export Private Key** and save the base58 string to a file:
 
 ```bash
+mkdir -p ~/.config/solana
+echo 'PASTE_BASE58_KEY_HERE' > ~/.config/solana/bot-wallet.txt
 chmod 600 ~/.config/solana/bot-wallet.txt
 ```
 
@@ -97,11 +111,17 @@ with `[`) and otherwise treats the file as a base58 secret key.
 
 ### Funding
 
-Switch your wallet to **Devnet** for testing, then airdrop test SOL:
+Only `rehearse` (devnet) and `live` (mainnet) need funds. `detect` and
+`simulate` spend nothing.
+
+For devnet test SOL:
 
 ```bash
 solana airdrop 1 <bot-wallet-address> --url devnet
 ```
+
+Without the Solana CLI, use [faucet.solana.com](https://faucet.solana.com) with
+your wallet address.
 
 For mainnet, send a small, deliberate amount from your main wallet to the bot
 wallet's public address.
@@ -128,15 +148,32 @@ cargo build --release
 ```
 </details>
 
-Then work up the ladder, one rung at a time:
+Then work up the ladder, one rung at a time. Run these one at a time, not as a
+block — and do not append `# comments`, which zsh passes as arguments:
 
 ```bash
-cargo run --example offline_demo               # 1. logic, no network or funds
-cargo run --release -- start                   # 2. live prices, spends nothing
-cargo run --release -- start --mode rehearse --yes   # 3. real devnet submit
-cargo run --release -- start --mode simulate --yes   # 4. real tx, not sent
-cargo run --release -- start --mode live --yes       # 5. real money
+cargo run --example offline_demo
 ```
+```bash
+cargo run --release -- start
+```
+```bash
+cargo run --release -- start --mode rehearse --yes
+```
+```bash
+cargo run --release -- start --mode simulate --yes
+```
+```bash
+cargo run --release -- start --mode live --yes
+```
+
+| Rung | Proves | Risk |
+| --- | --- | --- |
+| 1 `offline_demo` | Detection and safety logic | none — no network or wallet |
+| 2 `start` | Live prices arrive and are evaluated | none — nothing is built or sent |
+| 3 `rehearse` | Signing, submission and confirmation work | none — devnet test SOL |
+| 4 `simulate` | The real swap transaction is valid | none — never submitted |
+| 5 `live` | — | **real funds** |
 
 Step 3 needs devnet SOL:
 `solana airdrop 1 $(solana-keygen pubkey ~/.config/solana/bot-wallet.json) --url devnet`
@@ -165,7 +202,8 @@ All runtime configuration comes from environment variables in `.env` (see
 Notes:
 
 - `WALLET_PATH` does **not** expand `~` — use an absolute path.
-- `config/config.json` is **not read by the bot**. Only `.env` matters.
+- **`.env` is the only configuration source.** There is no config file; the
+  previous `config/*.json` files were read by nothing and have been removed.
 - Leaving `JUPITER_API_KEY` unset uses Jupiter's free tier
   (`lite-api.jup.ag`), which needs no signup but is rate limited. Setting a key
   switches to the paid host automatically.
@@ -173,21 +211,54 @@ Notes:
 ## Usage
 
 ```bash
-cargo run -- start                          # detect (default): watch only
-cargo run -- start --mode rehearse --yes    # real devnet submit, free test SOL
-cargo run -- start --mode simulate --yes    # real mainnet tx, not submitted
-cargo run -- start --mode live --yes        # real trade (needs both caps set)
+cargo run -- start
+cargo run -- start --mode rehearse --yes
+cargo run -- start --mode simulate --yes
+cargo run -- start --mode live --yes
 
-cargo run -- start --once                   # single scan instead of looping
-cargo run -- start -a 0.05 -p 2.0           # 0.05 SOL trades, 2% min net profit
-cargo run -- status                         # status as JSON
-cargo run -- history                        # recorded trades + realised loss
+cargo run -- start --once
+cargo run -- start -a 0.05 -p 2.0
+cargo run -- status
+cargo run -- history
+cargo run -- strategies
+cargo run -- test-alert
 ```
+
+| Command | What it does |
+| --- | --- |
+| `start` | Run the bot (`detect` mode by default — watches only) |
+| `start --mode rehearse --yes` | Real devnet submit, free test SOL |
+| `start --mode simulate --yes` | Real mainnet tx, validated but not sent |
+| `start --mode live --yes` | Real trade — needs **both** caps set |
+| `start --once` | Single scan instead of looping |
+| `start -a 0.05 -p 2.0` | 0.05 SOL trades, 2% minimum net profit |
+| `status` | Current state as JSON |
+| `history` | Recorded trades, costs, caps and realised loss |
+| `strategies` | List available strategies |
+| `test-alert` | Send one Discord alert to verify notification setup |
 
 Pass `--yes` to skip the confirmation prompt. The bot runs unattended: when no
 terminal is attached it proceeds automatically in the safe modes, and refuses to
 start in `live` without `--yes` rather than hanging on a prompt nothing can
 answer.
+
+> **zsh users:** do not paste a trailing `# comment` after a command. Unlike
+> bash, interactive zsh does not treat `#` as a comment, so it is passed as an
+> argument and the command fails with `unexpected argument '#' found`.
+
+### Seeing what it is doing
+
+By default a scan with no opportunity prints nothing, which is
+indistinguishable from a silent failure. Use:
+
+```bash
+RUST_LOG=info cargo run -- start
+```
+
+- `scanned 2 pair(s), no net-profitable opportunity` — working correctly, no
+  edge currently available. **This is the normal outcome.**
+- `quote SOL/USDC leg 1 failed: ...` — the price source is not responding as
+  expected.
 
 ## Testing
 

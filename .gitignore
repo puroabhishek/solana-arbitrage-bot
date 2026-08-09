@@ -1,28 +1,25 @@
-# Rust
+# Rust build output
 /target
 **/*.rs.bk
-Cargo.lock
 
-# Environment
+# Note: Cargo.lock IS committed. This is a binary, not a library, and
+# reproducible dependency versions matter when real funds are involved.
+
+# Environment and secrets — never commit these
 .env
 .env.local
+.env.bak
+wallet.json
+*.pem
+
+# Runtime state (trade ledger, which also backs the cumulative loss cap)
+data/
+logs/
+*.log
 
 # IDE
 .idea/
 .vscode/
 
-# Logs
-*.log
-bot.log
-
-# OS specific
+# OS
 .DS_Store
-/target
-Cargo.lock
-.env
-wallet.json
-config/*.json
-.DS_Store
-
-# Runtime state
-data/

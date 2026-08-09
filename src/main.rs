@@ -2,14 +2,14 @@ use anyhow::{Context, Result};
 use solana_arbitrage_bot::cli::BotInterface;
 use std::fs;
 
-// Initialize required directories
+/// Create the directories the bot actually writes to.
+///
+/// Only `data/` is used, for the trade ledger. Logging goes to stderr via
+/// `RUST_LOG`, and configuration comes from `.env` — neither needs a
+/// directory, so creating `logs/` and `config/` only implied storage that was
+/// never written.
 fn initialize_directories() -> Result<()> {
-    let required_dirs = vec!["config", "logs", "data"];
-    
-    for dir in required_dirs {
-        fs::create_dir_all(dir)
-            .context(format!("Failed to create directory: {}", dir))?;
-    }
+    fs::create_dir_all("data").context("Failed to create directory: data")?;
     Ok(())
 }
 
