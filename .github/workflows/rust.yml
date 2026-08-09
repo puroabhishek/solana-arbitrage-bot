@@ -13,22 +13,29 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    
-    - name: Install Solana
-      run: sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
-    
+    - uses: actions/checkout@v4
+
+    # The Solana CLI is deliberately not installed: the test suite generates
+    # keypairs in-process via solana-sdk and needs no network, wallet or CLI.
+    # The previous step also never added the binary to PATH, so it was doing
+    # nothing while adding time to every run.
+
     - name: Cache dependencies
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    
+        # Cargo.lock is gitignored, so hashing it alone yields an empty string
+        # and a key that never changes - the cache would go stale and never
+        # refresh. Hash the manifest instead, which is tracked.
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: Build
-      run: cargo build --verbose
-    
+      run: cargo build
+
     - name: Run tests
-      run: cargo test --verbose 
+      run: cargo test
